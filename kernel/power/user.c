@@ -25,19 +25,10 @@
 #include <linux/uaccess.h>
 
 #include "power.h"
+#include "user.h"
 
 static bool need_wait;
-
-static struct snapshot_data {
-	struct snapshot_handle handle;
-	int swap;
-	int mode;
-	bool frozen;
-	bool ready;
-	bool platform_support;
-	bool free_bitmaps;
-	dev_t dev;
-} snapshot_state;
+static struct snapshot_data snapshot_state;
 
 int is_hibernate_resume_dev(dev_t dev)
 {
@@ -57,13 +48,13 @@ static int snapshot_open(struct inode *inode, struct file *filp)
 
 	if (!hibernate_acquire()) {
 		error = -EBUSY;
-		goto Unlock;
+		goto unlock;
 	}
 
 	if ((filp->f_flags & O_ACCMODE) == O_RDWR) {
 		hibernate_release();
 		error = -ENOSYS;
-		goto Unlock;
+		goto unlock;
 	}
 	nonseekable_open(inode, filp);
 	data = &snapshot_state;
@@ -98,9 +89,10 @@ static int snapshot_open(struct inode *inode, struct file *filp)
 	data->frozen = false;
 	data->ready = false;
 	data->platform_support = false;
+	data->encryption_output_retired = false;
 	data->dev = 0;
 
- Unlock:
+ unlock:
 	unlock_system_sleep(sleep_flags);
 
 	return error;
@@ -125,6 +117,7 @@ static int snapshot_release(struct inode *inode, struct file *filp)
 	} else if (data->free_bitmaps) {
 		free_basic_memory_bitmaps();
 	}
+	snapshot_teardown_encryption(data);
 	pm_notifier_call_chain(data->mode == O_RDONLY ?
 			PM_POST_HIBERNATION : PM_POST_RESTORE);
 	hibernate_release();
@@ -147,12 +140,23 @@ static ssize_t snapshot_read(struct file *filp, char __user *buf,
 	data = filp->private_data;
 	if (!data->ready) {
 		res = -ENODATA;
-		goto Unlock;
+		goto unlock;
 	}
+
+	if (data->encryption_output_retired) {
+		res = -EPERM;
+		goto unlock;
+	}
+
+	if (snapshot_encryption_enabled(data)) {
+		res = snapshot_read_encrypted(data, buf, count, offp);
+		goto unlock;
+	}
+
 	if (!pg_offp) { /* on page boundary? */
 		res = snapshot_read_next(&data->handle);
 		if (res <= 0)
-			goto Unlock;
+			goto unlock;
 	} else {
 		res = PAGE_SIZE - pg_offp;
 	}
@@ -162,7 +166,7 @@ static ssize_t snapshot_read(struct file *filp, char __user *buf,
 	if (res > 0)
 		*offp += res;
 
- Unlock:
+ unlock:
 	unlock_system_sleep(sleep_flags);
 
 	return res;
@@ -184,6 +188,11 @@ static ssize_t snapshot_write(struct file *filp, const char __user *buf,
 	sleep_flags = lock_system_sleep();
 
 	data = filp->private_data;
+
+	if (snapshot_encryption_enabled(data)) {
+		res = snapshot_write_encrypted(data, buf, count, offp);
+		goto unlock;
+	}
 
 	if (!pg_offp) {
 		res = snapshot_write_next(&data->handle);
@@ -314,12 +323,20 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 		break;
 
 	case SNAPSHOT_CREATE_IMAGE:
-		if (data->mode != O_RDONLY || !data->frozen  || data->ready) {
+		if (data->mode != O_RDONLY || !data->frozen || data->ready ||
+		    data->encryption_output_retired) {
 			error = -EPERM;
 			break;
 		}
 		pm_restore_gfp_mask();
 		error = hibernation_snapshot(data->platform_support);
+		/* Restore also brings back the pre-export GCM key and nonce. */
+		if (!in_suspend && !freezer_test_done &&
+		    snapshot_encryption_enabled(data)) {
+			data->encryption_output_retired = true;
+			/* Header cleanup may sync filesystem workers. */
+			thaw_kernel_threads();
+		}
 		if (!error) {
 			error = put_user(in_suspend, (int __user *)arg);
 			data->ready = !freezer_test_done && !error;
@@ -328,6 +345,12 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 		break;
 
 	case SNAPSHOT_ATOMIC_RESTORE:
+		if (snapshot_encryption_enabled(data)) {
+			error = snapshot_finalize_decrypted_image(data);
+			if (error)
+				break;
+		}
+
 		error = snapshot_write_finalize(&data->handle);
 		if (error)
 			break;
@@ -346,6 +369,8 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 		swsusp_free();
 		memset(&data->handle, 0, sizeof(struct snapshot_handle));
 		data->ready = false;
+		snapshot_teardown_encryption(data);
+		data->encryption_output_retired = false;
 		/*
 		 * It is necessary to thaw kernel threads here, because
 		 * SNAPSHOT_CREATE_IMAGE may be invoked directly after
@@ -368,6 +393,8 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 		}
 		size = snapshot_get_image_size();
 		size <<= PAGE_SHIFT;
+		if (snapshot_encryption_enabled(data))
+			size = snapshot_get_encrypted_image_size(data, size);
 		error = put_user(size, (loff_t __user *)arg);
 		break;
 
@@ -425,6 +452,17 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 		error = snapshot_set_swap_area(data, (void __user *)arg);
 		break;
 
+	case SNAPSHOT_ENABLE_ENCRYPTION:
+		if (data->mode == O_RDONLY)
+			error = snapshot_get_encryption_key(data, (void __user *)arg);
+		else
+			error = snapshot_set_encryption_key(data, (void __user *)arg);
+		break;
+
+	case SNAPSHOT_SET_USER_KEY:
+		error = snapshot_set_user_key(data, (void __user *)arg);
+		break;
+
 	default:
 		error = -ENOTTY;
 
@@ -448,6 +486,8 @@ snapshot_compat_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case SNAPSHOT_ALLOC_SWAP_PAGE:
 	case SNAPSHOT_CREATE_IMAGE:
 	case SNAPSHOT_SET_SWAP_AREA:
+	case SNAPSHOT_ENABLE_ENCRYPTION:
+	case SNAPSHOT_SET_USER_KEY:
 		return snapshot_ioctl(file, cmd,
 				      (unsigned long) compat_ptr(arg));
 	default:
