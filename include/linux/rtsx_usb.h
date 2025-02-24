@@ -51,6 +51,8 @@ struct rtsx_ucr {
 
 	unsigned int		cur_clk;
 
+	u8			card_exist;
+
 	u8			*cmd_buf;
 	unsigned int		cmd_idx;
 	u8			*rsp_buf;

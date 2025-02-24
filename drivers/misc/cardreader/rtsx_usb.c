@@ -309,25 +309,46 @@ int rtsx_usb_get_card_status(struct rtsx_ucr *ucr, u16 *status)
 		ret = rtsx_usb_get_status_with_bulk(ucr, status);
 	}
 
-	rtsx_usb_read_register(ucr, CARD_INT_PEND, &interrupt_val);
-	/* Cross check presence with interrupts */
-	if (*status & XD_CD)
-		if (!(interrupt_val & XD_INT))
-			*status &= ~XD_CD;
+	/* Avoid stale data */
+	if (ret < 0) {
+		*status = 0;
+		rtsx_usb_write_register(ucr, MC_FIFO_CTL, FIFO_FLUSH, FIFO_FLUSH);
+		rtsx_usb_write_register(ucr, SFSM_ED, 0xf8, 0xf8);
+	}
 
-	if (*status & SD_CD)
-		if (!(interrupt_val & SD_INT))
-			*status &= ~SD_CD;
+	/* Reset and track card existence */
+	ucr->card_exist = 0;
 
-	if (*status & MS_CD)
-		if (!(interrupt_val & MS_INT))
-			*status &= ~MS_CD;
+	if ((*status & XD_CD) || (*status & SD_CD) || (*status & MS_CD)) {
+		rtsx_usb_read_register(ucr, CARD_INT_PEND, &interrupt_val);
 
-	/* usb_control_msg may return positive when success */
-	if (ret < 0)
-		return ret;
+		if (*status & XD_CD) {
+			if (!(interrupt_val & XD_INT))
+				*status &= ~XD_CD;
+			else
+				ucr->card_exist |= XD_CD;
+		}
 
-	return 0;
+		if (*status & SD_CD) {
+			if (!(interrupt_val & SD_INT))
+				*status &= ~SD_CD;
+			else
+				ucr->card_exist |= SD_CD;
+		}
+
+		if (*status & MS_CD) {
+			if (!(interrupt_val & MS_INT))
+				*status &= ~MS_CD;
+			else
+				ucr->card_exist |= MS_CD;
+		}
+
+		/* Clear pending interrupts */
+		rtsx_usb_write_register(ucr, CARD_INT_PEND,
+			(XD_INT | MS_INT | SD_INT), (XD_INT | MS_INT | SD_INT));
+	}
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(rtsx_usb_get_card_status);
 
