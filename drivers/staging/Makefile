@@ -3,6 +3,7 @@
 
 obj-y				+= media/
 obj-$(CONFIG_RTL8723BS)		+= rtl8723bs/
+obj-$(CONFIG_RTS5139)		+= rts5139/
 obj-$(CONFIG_OCTEON_ETHERNET)	+= octeon/
 obj-$(CONFIG_VME_BUS)		+= vme_user/
 obj-$(CONFIG_IIO)		+= iio/
