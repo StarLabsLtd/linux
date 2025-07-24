@@ -1036,7 +1036,7 @@ static int sd_set_power_mode(struct rtsx_usb_sdmmc *host,
 }
 
 static int sd_set_timing(struct rtsx_usb_sdmmc *host,
-		unsigned char timing, bool *ddr_mode)
+			 unsigned char timing, bool *ddr_mode)
 {
 	struct rtsx_ucr *ucr = host->ucr;
 
@@ -1046,50 +1046,64 @@ static int sd_set_timing(struct rtsx_usb_sdmmc *host,
 
 	switch (timing) {
 	case MMC_TIMING_UHS_SDR104:
+		rtsx_usb_add_cmd(ucr, WRITE_REG_CMD, SD_CFG1,
+				 0x0C | SD_ASYNC_FIFO_RST,
+				 SD_30_MODE | SD_ASYNC_FIFO_RST);
+		rtsx_usb_add_cmd(ucr, WRITE_REG_CMD, CARD_CLK_SOURCE, 0xFF,
+				 CRC_VAR_CLK0 | SD30_FIX_CLK | SAMPLE_VAR_CLK1);
+		rtsx_usb_add_cmd(ucr, WRITE_REG_CMD, SD_PUSH_POINT_CTL,
+				 SD20_TX_SEL_MASK, SD20_TX_14_AHEAD);
+		rtsx_usb_add_cmd(ucr, WRITE_REG_CMD, SD_SAMPLE_POINT_CTL,
+				 SD20_RX_SEL_MASK, SD20_RX_14_DELAY);
+		break;
+
 	case MMC_TIMING_UHS_SDR50:
 		rtsx_usb_add_cmd(ucr, WRITE_REG_CMD, SD_CFG1,
-				0x0C | SD_ASYNC_FIFO_RST,
-				SD_30_MODE | SD_ASYNC_FIFO_RST);
+				 0x0C | SD_ASYNC_FIFO_RST,
+				 SD_30_MODE | SD_ASYNC_FIFO_RST);
 		rtsx_usb_add_cmd(ucr, WRITE_REG_CMD, CARD_CLK_SOURCE, 0xFF,
-				CRC_VAR_CLK0 | SD30_FIX_CLK | SAMPLE_VAR_CLK1);
+				 CRC_VAR_CLK0 | SD30_FIX_CLK | SAMPLE_VAR_CLK1);
+		rtsx_usb_add_cmd(ucr, WRITE_REG_CMD, SD_PUSH_POINT_CTL,
+				 SD20_TX_SEL_MASK, SD20_TX_14_AHEAD);
+		rtsx_usb_add_cmd(ucr, WRITE_REG_CMD, SD_SAMPLE_POINT_CTL,
+				 SD20_RX_SEL_MASK, SD20_RX_14_DELAY);
 		break;
 
 	case MMC_TIMING_UHS_DDR50:
 		*ddr_mode = true;
 
 		rtsx_usb_add_cmd(ucr, WRITE_REG_CMD, SD_CFG1,
-				0x0C | SD_ASYNC_FIFO_RST,
-				SD_DDR_MODE | SD_ASYNC_FIFO_RST);
+				 0x0C | SD_ASYNC_FIFO_RST,
+				 SD_DDR_MODE | SD_ASYNC_FIFO_RST);
 		rtsx_usb_add_cmd(ucr, WRITE_REG_CMD, CARD_CLK_SOURCE, 0xFF,
-				CRC_VAR_CLK0 | SD30_FIX_CLK | SAMPLE_VAR_CLK1);
+				 CRC_VAR_CLK0 | SD30_FIX_CLK | SAMPLE_VAR_CLK1);
 		rtsx_usb_add_cmd(ucr, WRITE_REG_CMD, SD_PUSH_POINT_CTL,
-				DDR_VAR_TX_CMD_DAT, DDR_VAR_TX_CMD_DAT);
+				 DDR_VAR_TX_CMD_DAT, DDR_VAR_TX_CMD_DAT);
 		rtsx_usb_add_cmd(ucr, WRITE_REG_CMD, SD_SAMPLE_POINT_CTL,
-				DDR_VAR_RX_DAT | DDR_VAR_RX_CMD,
-				DDR_VAR_RX_DAT | DDR_VAR_RX_CMD);
+				 DDR_VAR_RX_DAT | DDR_VAR_RX_CMD,
+				 DDR_VAR_RX_DAT | DDR_VAR_RX_CMD);
 		break;
 
 	case MMC_TIMING_MMC_HS:
 	case MMC_TIMING_SD_HS:
 		rtsx_usb_add_cmd(ucr, WRITE_REG_CMD, SD_CFG1,
-				0x0C, SD_20_MODE);
+				 0x0C, SD_20_MODE);
 		rtsx_usb_add_cmd(ucr, WRITE_REG_CMD, CARD_CLK_SOURCE, 0xFF,
-				CRC_FIX_CLK | SD30_VAR_CLK0 | SAMPLE_VAR_CLK1);
+				 CRC_FIX_CLK | SD30_VAR_CLK0 | SAMPLE_VAR_CLK1);
 		rtsx_usb_add_cmd(ucr, WRITE_REG_CMD, SD_PUSH_POINT_CTL,
-				SD20_TX_SEL_MASK, SD20_TX_14_AHEAD);
+				 SD20_TX_SEL_MASK, SD20_TX_14_AHEAD);
 		rtsx_usb_add_cmd(ucr, WRITE_REG_CMD, SD_SAMPLE_POINT_CTL,
-				SD20_RX_SEL_MASK, SD20_RX_14_DELAY);
+				 SD20_RX_SEL_MASK, SD20_RX_14_DELAY);
 		break;
 
 	default:
-		rtsx_usb_add_cmd(ucr, WRITE_REG_CMD,
-				SD_CFG1, 0x0C, SD_20_MODE);
+		rtsx_usb_add_cmd(ucr, WRITE_REG_CMD, SD_CFG1, 0x0C, SD_20_MODE);
 		rtsx_usb_add_cmd(ucr, WRITE_REG_CMD, CARD_CLK_SOURCE, 0xFF,
-				CRC_FIX_CLK | SD30_VAR_CLK0 | SAMPLE_VAR_CLK1);
-		rtsx_usb_add_cmd(ucr, WRITE_REG_CMD,
-				SD_PUSH_POINT_CTL, 0xFF, 0);
+				 CRC_FIX_CLK | SD30_VAR_CLK0 | SAMPLE_VAR_CLK1);
+		rtsx_usb_add_cmd(ucr, WRITE_REG_CMD, SD_PUSH_POINT_CTL,
+				 SD20_TX_SEL_MASK, SD20_TX_14_AHEAD);
 		rtsx_usb_add_cmd(ucr, WRITE_REG_CMD, SD_SAMPLE_POINT_CTL,
-				SD20_RX_SEL_MASK, SD20_RX_POS_EDGE);
+				 SD20_RX_SEL_MASK, SD20_RX_14_DELAY);
 		break;
 	}
 
