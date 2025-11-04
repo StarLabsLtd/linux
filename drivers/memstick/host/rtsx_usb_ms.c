@@ -12,6 +12,7 @@
 #include <linux/delay.h>
 #include <linux/platform_device.h>
 #include <linux/workqueue.h>
+#include <linux/jiffies.h>
 #include <linux/memstick.h>
 #include <linux/kthread.h>
 #include <linux/rtsx_usb.h>
@@ -20,6 +21,9 @@
 #include <linux/sched.h>
 #include <linux/completion.h>
 #include <linux/unaligned.h>
+
+#define RTSX_USB_MS_POLL_INTERVAL	msecs_to_jiffies(50)
+#define RTSX_USB_MS_IDLE_POLL_INTERVAL	msecs_to_jiffies(1000)
 
 struct rtsx_usb_ms {
 	struct platform_device	*pdev;
@@ -30,6 +34,7 @@ struct rtsx_usb_ms {
 	struct mutex		host_mutex;
 	struct work_struct	handle_req;
 	struct delayed_work	poll_card;
+	unsigned long		poll_interval;
 
 	u8			ssc_depth;
 	unsigned int		clock;
@@ -635,8 +640,11 @@ out:
 	if (param == MEMSTICK_POWER && value == MEMSTICK_POWER_ON) {
 		usleep_range(10000, 12000);
 
-		if (!host->eject)
-			schedule_delayed_work(&host->poll_card, 100);
+		if (!host->eject) {
+			host->poll_interval = RTSX_USB_MS_POLL_INTERVAL;
+			queue_delayed_work(system_wq, &host->poll_card,
+					host->poll_interval);
+		}
 	}
 
 	dev_dbg(ms_dev(host), "%s: return = %d\n", __func__, err);
@@ -723,6 +731,7 @@ static void rtsx_usb_ms_poll_card(struct work_struct *work)
 	struct rtsx_ucr *ucr = host->ucr;
 	int err;
 	u8 val;
+	bool event_pending = false;
 
 	if (host->eject || host->power_mode != MEMSTICK_POWER_ON)
 		return;
@@ -747,13 +756,20 @@ static void rtsx_usb_ms_poll_card(struct work_struct *work)
 	if (val & MS_INT) {
 		dev_dbg(ms_dev(host), "MS slot change detected\n");
 		memstick_detect_change(host->msh);
+		event_pending = true;
 	}
 
 poll_again:
 	pm_runtime_put_sync(ms_dev(host));
 
-	if (!host->eject && host->power_mode == MEMSTICK_POWER_ON)
-		schedule_delayed_work(&host->poll_card, 100);
+	if (!host->eject && host->power_mode == MEMSTICK_POWER_ON) {
+		bool request_active = READ_ONCE(host->req) != NULL;
+		unsigned long delay = (event_pending || request_active) ?
+			RTSX_USB_MS_POLL_INTERVAL : RTSX_USB_MS_IDLE_POLL_INTERVAL;
+
+		host->poll_interval = delay;
+		queue_delayed_work(system_wq, &host->poll_card, delay);
+	}
 }
 
 static int rtsx_usb_ms_drv_probe(struct platform_device *pdev)
@@ -784,6 +800,7 @@ static int rtsx_usb_ms_drv_probe(struct platform_device *pdev)
 	mutex_init(&host->host_mutex);
 	INIT_WORK(&host->handle_req, rtsx_usb_ms_handle_req);
 
+	host->poll_interval = RTSX_USB_MS_POLL_INTERVAL;
 	INIT_DELAYED_WORK(&host->poll_card, rtsx_usb_ms_poll_card);
 
 	msh->request = rtsx_usb_ms_request;
