@@ -19,6 +19,8 @@
 #include <linux/scatterlist.h>
 #include <linux/pm.h>
 #include <linux/pm_runtime.h>
+#include <linux/workqueue.h>
+#include <linux/jiffies.h>
 
 #include <linux/rtsx_usb.h>
 #include <linux/unaligned.h>
@@ -26,9 +28,13 @@
 #if defined(CONFIG_LEDS_CLASS) || (defined(CONFIG_LEDS_CLASS_MODULE) && \
 		defined(CONFIG_MMC_REALTEK_USB_MODULE))
 #include <linux/leds.h>
-#include <linux/workqueue.h>
 #define RTSX_USB_USE_LEDS_CLASS
 #endif
+
+#define RTSX_USB_SD_POLL_INTERVAL	msecs_to_jiffies(50)
+#define RTSX_USB_SD_IDLE_POLL_INTERVAL	msecs_to_jiffies(1000)
+#define RTSX_USB_SD_IDLE_WAIT_MAX	10
+#define RTSX_USB_SD_SEQ_WAIT_MAX	2
 
 struct rtsx_usb_sdmmc {
 	struct platform_device	*pdev;
@@ -37,6 +43,15 @@ struct rtsx_usb_sdmmc {
 	struct mmc_request	*mrq;
 
 	struct mutex		host_mutex;
+	struct delayed_work	card_poll;
+	unsigned long		poll_interval;
+	unsigned int		idle_counter;
+	unsigned int		idle_wait_max;
+	bool			idle;
+	bool			seq_mode;
+	bool			seq_read;
+	unsigned int		seq_counter;
+	unsigned int		seq_wait_max;
 
 	u8			ssc_depth;
 	unsigned int		clock;
@@ -70,6 +85,78 @@ static inline void sd_clear_error(struct rtsx_usb_sdmmc *host)
 
 	rtsx_usb_clear_dma_err(ucr);
 	rtsx_usb_clear_fsm_err(ucr);
+}
+
+static void sdmmc_stop_seq_mode(struct rtsx_usb_sdmmc *host)
+{
+	struct mmc_command stop = { };
+
+	if (!host->seq_mode)
+		return;
+
+	stop.opcode = MMC_STOP_TRANSMISSION;
+	stop.arg = 0;
+	stop.flags = MMC_RSP_R1B | MMC_CMD_AC;
+
+	sd_send_cmd_get_rsp(host, &stop);
+	if (stop.error)
+		dev_dbg(sdmmc_dev(host), "stop transmission err %d\n",
+			stop.error);
+
+	rtsx_usb_write_register(host->ucr, MC_FIFO_CTL,
+				      FIFO_FLUSH, FIFO_FLUSH);
+	host->seq_mode = false;
+	host->seq_read = false;
+	host->seq_counter = 0;
+}
+
+static void sdmmc_enter_idle(struct rtsx_usb_sdmmc *host)
+{
+	struct rtsx_ucr *ucr = host->ucr;
+	int err;
+
+	if (host->idle)
+		return;
+
+	err = rtsx_usb_write_register(ucr, CLK_DIV, CLK_CHANGE, CLK_CHANGE);
+	if (err)
+		goto out_dbg;
+
+	err = rtsx_usb_write_register(ucr, FPDCTL,
+				      SSC_POWER_MASK, SSC_POWER_DOWN);
+	if (!err)
+		host->idle = true;
+
+out_dbg:
+	if (err)
+		dev_dbg(sdmmc_dev(host), "enter idle failed %d\n", err);
+	else
+		host->idle_counter = host->idle_wait_max;
+}
+
+static void sdmmc_leave_idle(struct rtsx_usb_sdmmc *host)
+{
+	struct rtsx_ucr *ucr = host->ucr;
+	int err;
+
+	if (!host->idle)
+		return;
+
+	err = rtsx_usb_write_register(ucr, FPDCTL,
+				      SSC_POWER_MASK, SSC_POWER_ON);
+	if (err)
+		goto out_dbg;
+
+	usleep_range(100, 150);
+	err = rtsx_usb_write_register(ucr, CLK_DIV, CLK_CHANGE, 0);
+	if (!err)
+		host->idle = false;
+
+out_dbg:
+	if (err)
+		dev_dbg(sdmmc_dev(host), "leave idle failed %d\n", err);
+	else
+		host->idle_counter = 0;
 }
 
 #ifdef DEBUG
@@ -507,8 +594,11 @@ static int sd_rw_multi(struct rtsx_usb_sdmmc *host, struct mmc_request *mrq)
 			SD_TRANSFER_END, SD_TRANSFER_END);
 
 	err = rtsx_usb_send_cmd(ucr, flag, 100);
-	if (err)
+	if (err) {
+		host->seq_mode = false;
+		host->seq_counter = 0;
 		return err;
+	}
 
 	if (read)
 		pipe = usb_rcvbulkpipe(ucr->pusb_dev, EP_BULK_IN);
@@ -521,10 +611,23 @@ static int sd_rw_multi(struct rtsx_usb_sdmmc *host, struct mmc_request *mrq)
 		dev_dbg(sdmmc_dev(host), "rtsx_usb_transfer_data error %d\n"
 				, err);
 		sd_clear_error(host);
+		host->seq_mode = false;
+		host->seq_counter = 0;
 		return err;
 	}
 
-	return rtsx_usb_get_rsp(ucr, 1, 2000);
+	err = rtsx_usb_get_rsp(ucr, 1, 2000);
+	if (!err) {
+		host->seq_mode = true;
+		host->seq_read = read;
+		host->seq_counter = 0;
+	} else {
+		dev_dbg(sdmmc_dev(host), "sd multi rsp err %d\n", err);
+		host->seq_mode = false;
+		host->seq_counter = 0;
+	}
+
+	return err;
 }
 
 static inline void sd_enable_initial_mode(struct rtsx_usb_sdmmc *host)
@@ -807,6 +910,119 @@ no_card:
 	return 0;
 }
 
+static void rtsx_usb_sdmmc_poll_card(struct work_struct *work)
+{
+	struct rtsx_usb_sdmmc *host = container_of(work,
+			struct rtsx_usb_sdmmc, card_poll.work);
+	struct rtsx_ucr *ucr = host->ucr;
+	struct device *dev = sdmmc_dev(host);
+	bool present = READ_ONCE(host->card_exist);
+	bool changed = false;
+	bool prev;
+	int err;
+	u16 status = 0;
+	u8 pend;
+
+	if (host->host_removal)
+		return;
+
+	err = pm_runtime_get_sync(dev);
+	if (err < 0) {
+		pm_runtime_put_noidle(dev);
+		goto requeue;
+	}
+
+	mutex_lock(&ucr->dev_mutex);
+
+	prev = READ_ONCE(host->card_exist);
+
+	err = rtsx_usb_get_card_status(ucr, &status);
+	if (!err) {
+		host->ocp_stat = (status >> 4) & 0x03;
+		present = !!(status & SD_CD);
+		if (host->ocp_stat & (MS_OCP_NOW | MS_OCP_EVER)) {
+			sdmmc_leave_idle(host);
+			rtsx_usb_write_register(ucr, CARD_OE,
+					SD_OUTPUT_EN, 0);
+		}
+	}
+
+	if (!err) {
+		err = rtsx_usb_read_register(ucr, CARD_INT_PEND, &pend);
+		if (!err && (pend & SD_INT)) {
+			rtsx_usb_write_register(ucr, CARD_INT_PEND,
+				SD_INT, SD_INT);
+			if (prev && present)
+				present = false;
+		}
+	}
+
+	if (!err && !present &&
+	    (host->ocp_stat & (MS_OCP_NOW | MS_OCP_EVER))) {
+		rtsx_usb_write_register(ucr, OCPCTL,
+				MS_OCP_CLEAR, MS_OCP_CLEAR);
+		host->ocp_stat = 0;
+	}
+
+	if (!err) {
+		bool busy = READ_ONCE(host->mrq) != NULL;
+
+		changed = present != prev;
+		WRITE_ONCE(host->card_exist, present);
+
+		if (busy) {
+			host->idle_counter = 0;
+			if (host->idle)
+				sdmmc_leave_idle(host);
+		} else if (!present) {
+			if (host->idle_counter < host->idle_wait_max)
+				host->idle_counter++;
+			if (!host->idle &&
+			    host->idle_counter >= host->idle_wait_max)
+				sdmmc_enter_idle(host);
+		} else {
+			host->idle_counter = 0;
+			if (host->idle)
+				sdmmc_leave_idle(host);
+		}
+
+		if (!present) {
+			if (host->seq_mode)
+				sdmmc_stop_seq_mode(host);
+			host->seq_mode = false;
+			host->seq_read = false;
+			host->seq_counter = 0;
+		} else if (host->seq_mode) {
+			if (busy) {
+				host->seq_counter = 0;
+			} else if (++host->seq_counter >= host->seq_wait_max) {
+				sdmmc_stop_seq_mode(host);
+			}
+		} else {
+			host->seq_counter = 0;
+		}
+	}
+
+	mutex_unlock(&ucr->dev_mutex);
+
+	pm_runtime_put_sync_suspend(dev);
+
+	if (changed)
+		mmc_detect_change(host->mmc, 0);
+
+requeue:
+	if (!host->host_removal) {
+		bool request_active = READ_ONCE(host->mrq) != NULL;
+		bool card_present = READ_ONCE(host->card_exist);
+		unsigned long delay = card_present || request_active ?
+			RTSX_USB_SD_POLL_INTERVAL :
+			RTSX_USB_SD_IDLE_POLL_INTERVAL;
+
+		host->poll_interval = delay;
+		queue_delayed_work(system_wq, &host->card_poll, delay);
+	}
+}
+
 static void sdmmc_request(struct mmc_host *mmc, struct mmc_request *mrq)
 {
 	struct rtsx_usb_sdmmc *host = mmc_priv(mmc);
@@ -832,10 +1048,14 @@ static void sdmmc_request(struct mmc_host *mmc, struct mmc_request *mrq)
 		goto finish_detect_card;
 	}
 	mutex_lock(&ucr->dev_mutex);
+	if (host->seq_mode)
+		sdmmc_stop_seq_mode(host);
 
 	mutex_lock(&host->host_mutex);
 	host->mrq = mrq;
 	mutex_unlock(&host->host_mutex);
+	sdmmc_leave_idle(host);
+	host->idle_counter = 0;
 
 	if (mrq->data)
 		data_size = data->blocks * data->blksz;
@@ -1051,6 +1271,8 @@ static void sd_set_power_mode(struct rtsx_usb_sdmmc *host,
 		if (err)
 			dev_dbg(sdmmc_dev(host), "power-off (err = %d)\n", err);
 		pm_runtime_put_noidle(sdmmc_dev(host));
+		sdmmc_enter_idle(host);
+		host->idle_counter = 0;
 		break;
 
 	case MMC_POWER_UP:
@@ -1060,11 +1282,15 @@ static void sd_set_power_mode(struct rtsx_usb_sdmmc *host,
 			dev_dbg(sdmmc_dev(host), "power-on (err = %d)\n", err);
 		/* issue the clock signals to card at least 74 clocks */
 		rtsx_usb_write_register(ucr, SD_BUS_STAT, SD_CLK_TOGGLE_EN, SD_CLK_TOGGLE_EN);
+		sdmmc_leave_idle(host);
+		host->idle_counter = 0;
 		break;
 
 	case MMC_POWER_ON:
 		/* stop to send the clock signals */
 		rtsx_usb_write_register(ucr, SD_BUS_STAT, SD_CLK_TOGGLE_EN, 0x00);
+		sdmmc_leave_idle(host);
+		host->idle_counter = 0;
 		break;
 
 	case MMC_POWER_UNDEFINED:
@@ -1367,6 +1593,13 @@ static void rtsx_usb_init_host(struct rtsx_usb_sdmmc *host)
 
 	host->power_mode = MMC_POWER_OFF;
 	host->ocp_stat = 0;
+	host->idle_counter = 0;
+	host->idle_wait_max = RTSX_USB_SD_IDLE_WAIT_MAX;
+	host->idle = false;
+	host->seq_mode = false;
+	host->seq_read = false;
+	host->seq_counter = 0;
+	host->seq_wait_max = RTSX_USB_SD_SEQ_WAIT_MAX;
 }
 
 static int rtsx_usb_sdmmc_drv_probe(struct platform_device *pdev)
@@ -1397,6 +1630,8 @@ static int rtsx_usb_sdmmc_drv_probe(struct platform_device *pdev)
 
 	mutex_init(&host->host_mutex);
 	rtsx_usb_init_host(host);
+	host->poll_interval = RTSX_USB_SD_POLL_INTERVAL;
+	INIT_DELAYED_WORK(&host->card_poll, rtsx_usb_sdmmc_poll_card);
 	pm_runtime_enable(&pdev->dev);
 
 #ifdef RTSX_USB_USE_LEDS_CLASS
@@ -1423,6 +1658,9 @@ static int rtsx_usb_sdmmc_drv_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	queue_delayed_work(system_wq, &host->card_poll,
+			 host->poll_interval);
+
 	return 0;
 }
 
@@ -1436,6 +1674,7 @@ static void rtsx_usb_sdmmc_drv_remove(struct platform_device *pdev)
 
 	mmc = host->mmc;
 	host->host_removal = true;
+	cancel_delayed_work_sync(&host->card_poll);
 
 	mutex_lock(&host->host_mutex);
 	if (host->mrq) {
