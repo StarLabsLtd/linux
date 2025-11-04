@@ -653,11 +653,21 @@ static int rtsx_usb_probe(struct usb_interface *intf,
 	mutex_init(&ucr->dev_mutex);
 
 	ucr->pusb_intf = intf;
+	ucr->supports_sdr50 = false;
+	ucr->supports_ddr50 = false;
+	ucr->supports_mmc_ddr = false;
 
 	/* initialize */
 	ret = rtsx_usb_init_chip(ucr);
 	if (ret)
 		goto out_init_fail;
+
+	if ((ucr->product_id == 0x0139 && ucr->package == LQFP48) ||
+	    ucr->product_id == 0x0140 || ucr->is_rts5179) {
+		ucr->supports_sdr50 = true;
+		ucr->supports_ddr50 = true;
+		ucr->supports_mmc_ddr = true;
+	}
 
 	/* initialize USB SG transfer timer */
 	timer_setup(&ucr->sg_timer, rtsx_usb_sg_timed_out, 0);

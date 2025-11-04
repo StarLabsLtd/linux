@@ -48,6 +48,9 @@ struct rtsx_ucr {
 	int			package;
 	u8			ic_version;
 	bool			is_rts5179;
+	bool			supports_sdr50;
+	bool			supports_ddr50;
+	bool			supports_mmc_ddr;
 
 	unsigned int		cur_clk;
 
