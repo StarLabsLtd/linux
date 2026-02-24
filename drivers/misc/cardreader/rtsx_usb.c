@@ -73,9 +73,13 @@ int rtsx_usb_transfer_data(struct rtsx_ucr *ucr, unsigned int pipe,
 	if (timeout < 600)
 		timeout = 600;
 
-	ret = usb_autopm_get_interface(ucr->pusb_intf);
-	if (ret)
-		return ret;
+	if (ucr->reset_resume) {
+		usb_autopm_get_interface_no_resume(ucr->pusb_intf);
+	} else {
+		ret = usb_autopm_get_interface(ucr->pusb_intf);
+		if (ret)
+			return ret;
+	}
 
 	if (num_sg)
 		ret = rtsx_usb_bulk_transfer_sglist(ucr, pipe,
@@ -87,7 +91,10 @@ int rtsx_usb_transfer_data(struct rtsx_ucr *ucr, unsigned int pipe,
 				   timeout);
 
 	usb_mark_last_busy(ucr->pusb_dev);
-	usb_autopm_put_interface(ucr->pusb_intf);
+	if (ucr->reset_resume)
+		usb_autopm_put_interface_no_suspend(ucr->pusb_intf);
+	else
+		usb_autopm_put_interface(ucr->pusb_intf);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(rtsx_usb_transfer_data);
@@ -322,6 +329,9 @@ int rtsx_usb_get_card_status(struct rtsx_ucr *ucr, u16 *status)
 	/* usb_control_msg may return positive when success */
 	if (ret < 0)
 		return ret;
+
+	ucr->card_status_cache = *status;
+	ucr->card_status_valid = true;
 
 	return 0;
 }
@@ -634,6 +644,7 @@ static int rtsx_usb_probe(struct usb_interface *intf,
 {
 	struct usb_device *usb_dev = interface_to_usbdev(intf);
 	struct rtsx_ucr *ucr;
+	u16 status;
 	int ret;
 
 	dev_dbg(&intf->dev,
@@ -669,6 +680,10 @@ static int rtsx_usb_probe(struct usb_interface *intf,
 	ret = rtsx_usb_init_chip(ucr);
 	if (ret)
 		goto out_init_fail;
+
+	ret = rtsx_usb_get_card_status(ucr, &status);
+	if (ret)
+		dev_dbg(&intf->dev, "initial card status read failed: %d\n", ret);
 
 	/* initialize USB SG transfer timer */
 	timer_setup(&ucr->sg_timer, rtsx_usb_sg_timed_out, 0);
@@ -719,27 +734,61 @@ static int rtsx_usb_resume_child(struct device *dev, void *data)
 	return 0;
 }
 
+static int rtsx_usb_child_is_bound(struct device *dev, void *data)
+{
+	bool *child_bound = data;
+
+	device_lock(dev);
+	if (dev->driver)
+		*child_bound = true;
+	device_unlock(dev);
+
+	return *child_bound;
+}
+
+static bool rtsx_usb_has_bound_child(struct usb_interface *intf)
+{
+	bool child_bound = false;
+
+	device_for_each_child(&intf->dev, &child_bound,
+			      rtsx_usb_child_is_bound);
+
+	return child_bound;
+}
+
+static u16 rtsx_usb_validated_card_status(struct rtsx_ucr *ucr, u16 status)
+{
+	status &= ~ucr->card_status_known_mask;
+	status |= ucr->card_status_validated & ucr->card_status_known_mask;
+
+	return status;
+}
+
 static int rtsx_usb_suspend(struct usb_interface *intf, pm_message_t message)
 {
 	struct rtsx_ucr *ucr =
 		(struct rtsx_ucr *)usb_get_intfdata(intf);
+	bool child_bound = false;
 	u16 val = 0;
 
 	dev_dbg(&intf->dev, "%s called with pm message 0x%04x\n",
 			__func__, message.event);
 
 	if (PMSG_IS_AUTO(message)) {
+		child_bound = rtsx_usb_has_bound_child(intf);
+
 		if (mutex_trylock(&ucr->dev_mutex)) {
-			rtsx_usb_get_card_status(ucr, &val);
+			if (ucr->card_status_valid)
+				val = ucr->card_status_cache;
+			else if (child_bound)
+				val = SD_CD | MS_CD;
+			val = rtsx_usb_validated_card_status(ucr, val);
 			mutex_unlock(&ucr->dev_mutex);
 
 			/* Defer the autosuspend if card exists */
 			if (val & (SD_CD | MS_CD)) {
 				device_for_each_child(&intf->dev, NULL, rtsx_usb_resume_child);
 				return -EAGAIN;
-			} else {
-				/* if the card does not exists, clear OCP status */
-				rtsx_usb_write_register(ucr, OCPCTL, MS_OCP_CLEAR, MS_OCP_CLEAR);
 			}
 		} else {
 			/* There is an ongoing operation*/
@@ -760,8 +809,14 @@ static int rtsx_usb_reset_resume(struct usb_interface *intf)
 {
 	struct rtsx_ucr *ucr =
 		(struct rtsx_ucr *)usb_get_intfdata(intf);
+	int ret;
 
-	rtsx_usb_reset_chip(ucr);
+	ucr->reset_resume = true;
+	ret = rtsx_usb_reset_chip(ucr);
+	ucr->reset_resume = false;
+	if (ret)
+		return ret;
+
 	device_for_each_child(&intf->dev, NULL, rtsx_usb_resume_child);
 	return 0;
 }

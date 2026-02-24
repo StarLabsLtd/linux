@@ -68,6 +68,17 @@ static inline struct device *sdmmc_dev(struct rtsx_usb_sdmmc *host)
 	return &(host->pdev->dev);
 }
 
+static void sdmmc_set_validated_cd(struct rtsx_usb_sdmmc *host, bool present)
+{
+	struct rtsx_ucr *ucr = host->ucr;
+
+	ucr->card_status_known_mask |= SD_CD;
+	if (present)
+		ucr->card_status_validated |= SD_CD;
+	else
+		ucr->card_status_validated &= ~SD_CD;
+}
+
 static inline void sd_clear_error(struct rtsx_usb_sdmmc *host)
 {
 	struct rtsx_ucr *ucr = host->ucr;
@@ -899,6 +910,7 @@ static int sdmmc_get_cd(struct mmc_host *mmc)
 	if (!cd_raw) {
 		host->cd_debounce = 0;
 		host->next_insert_check = 0;
+		sdmmc_set_validated_cd(host, false);
 		goto no_card_unlock;
 	}
 
@@ -910,8 +922,10 @@ static int sdmmc_get_cd(struct mmc_host *mmc)
 		if (sd_int) {
 			host->cd_debounce = 0;
 			host->next_insert_check = 0;
+			sdmmc_set_validated_cd(host, false);
 			goto no_card_unlock;
 		}
+		sdmmc_set_validated_cd(host, true);
 		mutex_unlock(&ucr->dev_mutex);
 		return 1;
 	}
@@ -932,11 +946,13 @@ static int sdmmc_get_cd(struct mmc_host *mmc)
 	if (!sdmmc_validate_insert_locked(host)) {
 		retry_delay = msecs_to_jiffies(RTSX_USB_SD_INSERT_RETRY_MS);
 		host->next_insert_check = jiffies + retry_delay;
+		sdmmc_set_validated_cd(host, false);
 		mmc_detect_change(mmc, retry_delay);
 		goto no_card_unlock;
 	}
 
 	host->card_exist = true;
+	sdmmc_set_validated_cd(host, true);
 	mutex_unlock(&ucr->dev_mutex);
 	return 1;
 
