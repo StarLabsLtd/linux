@@ -396,6 +396,20 @@ static int virtio_gpu_panic_queue_ctrl_sgs(struct virtio_gpu_device *vgdev,
 	return 0;
 }
 
+int virtio_gpu_wait_queue(struct virtio_gpu_queue *vgvq, unsigned int num_elem)
+{
+	int ret;
+
+	/* Wait up to 5 seconds for enough free slots to become available */
+	ret = wait_event_timeout(vgvq->ack_queue,
+				 vgvq->vq->num_free >= num_elem,
+				 5 * HZ);
+	if (ret == 0)
+		return -ETIMEDOUT;
+
+	return 0;
+}
+
 static int virtio_gpu_queue_ctrl_sgs(struct virtio_gpu_device *vgdev,
 				     struct virtio_gpu_vbuffer *vbuf,
 				     struct virtio_gpu_fence *fence,
