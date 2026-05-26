@@ -170,6 +170,14 @@ static unsigned int features[] = {
 };
 
 #ifdef CONFIG_PM_SLEEP
+static void virtgpu_hibernation_restore(struct virtio_gpu_device *vgdev)
+{
+	if (vgdev->hibernated) {
+		vgdev->hibernated = false;
+		virtio_gpu_object_restore_all(vgdev);
+	}
+}
+
 static int virtgpu_freeze(struct virtio_device *vdev)
 {
 	struct drm_device *dev = vdev->priv;
@@ -181,6 +189,9 @@ static int virtgpu_freeze(struct virtio_device *vdev)
 		DRM_ERROR("suspend error: %d\n", error);
 		return error;
 	}
+
+	if (vgdev->hibernated)
+		virtio_gpu_object_unref_all(vgdev);
 
 	flush_work(&vgdev->obj_free_work);
 	flush_work(&vgdev->ctrlq.dequeue_work);
@@ -204,6 +215,8 @@ static int virtgpu_freeze(struct virtio_device *vdev)
 	return 0;
 
 err_resume:
+	virtgpu_hibernation_restore(vgdev);
+
 	drm_mode_config_helper_resume(dev);
 
 	return error;
@@ -222,6 +235,8 @@ static int virtgpu_restore(struct virtio_device *vdev)
 	}
 
 	virtio_device_ready(vdev);
+
+	virtgpu_hibernation_restore(vgdev);
 
 	error = drm_mode_config_helper_resume(dev);
 	if (error) {
