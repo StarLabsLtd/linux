@@ -763,8 +763,18 @@ static int rtsx_usb_reset_resume(struct usb_interface *intf)
 {
 	struct rtsx_ucr *ucr =
 		(struct rtsx_ucr *)usb_get_intfdata(intf);
+	u8 pend;
+	bool sd_int = false;
 
+	mutex_lock(&ucr->dev_mutex);
+	/* reset_chip() acknowledges the pending insertion event. */
+	if (ucr->sd_slot.card_event &&
+	    !rtsx_usb_read_register(ucr, CARD_INT_PEND, &pend))
+		sd_int = pend & SD_INT;
 	rtsx_usb_reset_chip(ucr);
+	if (sd_int)
+		ucr->sd_slot.card_event(ucr->sd_slot.p_dev);
+	mutex_unlock(&ucr->dev_mutex);
 	device_for_each_child(&intf->dev, NULL, rtsx_usb_resume_child);
 	return 0;
 }

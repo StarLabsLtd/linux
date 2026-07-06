@@ -10,6 +10,7 @@
 #ifndef __RTSX_USB_H
 #define __RTSX_USB_H
 
+#include <linux/rtsx_common.h>
 #include <linux/usb.h>
 
 #define DRV_NAME_RTSX_USB		"rtsx_usb"
@@ -64,6 +65,9 @@ struct rtsx_ucr {
 
 	u16			card_status_cache;
 	bool			card_status_valid;
+
+	/* Registration and reset notification are protected by dev_mutex. */
+	struct rtsx_slot		sd_slot;
 };
 
 /* buffer size */

@@ -44,6 +44,7 @@ struct rtsx_usb_sdmmc {
 	bool			double_clk;
 	bool			host_removal;
 	bool			card_exist;
+	bool			suppress_cd;
 	bool			initial_mode;
 	bool			ddr_mode;
 
@@ -773,7 +774,11 @@ static int sdmmc_get_cd(struct mmc_host *mmc)
 	struct rtsx_usb_sdmmc *host = mmc_priv(mmc);
 	struct rtsx_ucr *ucr = host->ucr;
 	int err;
+	int int_err;
 	u16 val;
+	u8 pend;
+	bool cd;
+	bool sd_int = false;
 
 	if (host->host_removal)
 		return -ENOMEDIUM;
@@ -782,6 +787,14 @@ static int sdmmc_get_cd(struct mmc_host *mmc)
 
 	/* Check SD card detect */
 	err = rtsx_usb_get_card_status(ucr, &val);
+	if (!err) {
+		int_err = rtsx_usb_read_register(ucr, CARD_INT_PEND, &pend);
+		if (!int_err && (pend & SD_INT)) {
+			sd_int = true;
+			rtsx_usb_write_register(ucr, CARD_INT_PEND, SD_INT,
+						SD_INT);
+		}
+	}
 
 	mutex_unlock(&ucr->dev_mutex);
 
@@ -791,8 +804,17 @@ static int sdmmc_get_cd(struct mmc_host *mmc)
 
 	/* get OCP status */
 	host->ocp_stat = (val >> 4) & 0x03;
+	cd = val & SD_CD;
 
-	if (val & SD_CD) {
+	if (!cd) {
+		WRITE_ONCE(host->suppress_cd, false);
+		goto no_card;
+	}
+
+	if (sd_int)
+		WRITE_ONCE(host->suppress_cd, false);
+
+	if (!READ_ONCE(host->suppress_cd)) {
 		host->card_exist = true;
 		return 1;
 	}
@@ -805,6 +827,15 @@ no_card:
 	}
 	host->card_exist = false;
 	return 0;
+}
+
+static bool sdmmc_timeout_suppresses_cd(struct mmc_host *mmc,
+					struct mmc_command *cmd)
+{
+	/* MMC discovery is the last protocol attempted by mmc_rescan(). */
+	return !mmc->card && cmd->opcode == MMC_SEND_OP_COND &&
+		cmd->error == -ETIMEDOUT && !cmd->retries &&
+		mmc->f_init <= mmc->f_min;
 }
 
 static void sdmmc_request(struct mmc_host *mmc, struct mmc_request *mrq)
@@ -874,6 +905,8 @@ finish_detect_card:
 		 * detect card when fail to update card existence state and
 		 * speed up card removal when retry
 		 */
+		if (sdmmc_timeout_suppresses_cd(mmc, cmd))
+			WRITE_ONCE(host->suppress_cd, true);
 		sdmmc_get_cd(mmc);
 		dev_dbg(sdmmc_dev(host), "cmd->error = %d\n", cmd->error);
 	}
@@ -1359,6 +1392,15 @@ static void rtsx_usb_init_host(struct rtsx_usb_sdmmc *host)
 
 	host->power_mode = MMC_POWER_OFF;
 	host->ocp_stat = 0;
+	host->suppress_cd = false;
+}
+
+static void rtsx_usb_sdmmc_card_event(struct platform_device *pdev)
+{
+	struct rtsx_usb_sdmmc *host = platform_get_drvdata(pdev);
+
+	WRITE_ONCE(host->suppress_cd, false);
+	mmc_detect_change(host->mmc, 0);
 }
 
 static int rtsx_usb_sdmmc_drv_probe(struct platform_device *pdev)
@@ -1415,6 +1457,10 @@ static int rtsx_usb_sdmmc_drv_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	mutex_lock(&ucr->dev_mutex);
+	ucr->sd_slot.p_dev = pdev;
+	ucr->sd_slot.card_event = rtsx_usb_sdmmc_card_event;
+	mutex_unlock(&ucr->dev_mutex);
 	return 0;
 }
 
@@ -1427,7 +1473,11 @@ static void rtsx_usb_sdmmc_drv_remove(struct platform_device *pdev)
 		return;
 
 	mmc = host->mmc;
+	mutex_lock(&host->ucr->dev_mutex);
+	host->ucr->sd_slot.card_event = NULL;
+	host->ucr->sd_slot.p_dev = NULL;
 	host->host_removal = true;
+	mutex_unlock(&host->ucr->dev_mutex);
 
 	mutex_lock(&host->host_mutex);
 	if (host->mrq) {
@@ -1466,10 +1516,20 @@ static int rtsx_usb_sdmmc_runtime_suspend(struct device *dev)
 static int rtsx_usb_sdmmc_runtime_resume(struct device *dev)
 {
 	struct rtsx_usb_sdmmc *host = dev_get_drvdata(dev);
+	struct mmc_host *mmc = host->mmc;
+	unsigned long flags;
+	bool claimed;
 
-	host->mmc->caps |= MMC_CAP_NEEDS_POLL;
-	if (sdmmc_get_cd(host->mmc) == 1)
-		mmc_detect_change(host->mmc, 0);
+	mmc->caps |= MMC_CAP_NEEDS_POLL;
+	spin_lock_irqsave(&mmc->lock, flags);
+	claimed = mmc->claimed && !READ_ONCE(mmc->card);
+	spin_unlock_irqrestore(&mmc->lock, flags);
+
+	/* Don't restart discovery during an owned no-card operation. */
+	if (!host->host_removal && !claimed) {
+		WRITE_ONCE(host->suppress_cd, false);
+		mmc_detect_change(mmc, 0);
+	}
 	return 0;
 }
 
