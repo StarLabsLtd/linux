@@ -3911,6 +3911,13 @@ static void sd_unlock_native_capacity(struct gendisk *disk)
 		sdev->host->hostt->unlock_native_capacity(sdev);
 }
 
+static bool sd_hibernation_protected(struct gendisk *disk)
+{
+	struct scsi_disk *sdkp = scsi_disk(disk);
+
+	return opal_dev_locking_enabled(sdkp->opal_dev);
+}
+
 static const struct block_device_operations sd_fops = {
 	.owner			= THIS_MODULE,
 	.open			= sd_open,
@@ -3920,6 +3927,7 @@ static const struct block_device_operations sd_fops = {
 	.compat_ioctl		= blkdev_compat_ptr_ioctl,
 	.check_events		= sd_check_events,
 	.unlock_native_capacity	= sd_unlock_native_capacity,
+	.hibernation_protected	= sd_hibernation_protected,
 	.report_zones		= sd_zbc_report_zones,
 	.get_unique_id		= sd_get_unique_id,
 	.free_disk		= scsi_disk_free_disk,

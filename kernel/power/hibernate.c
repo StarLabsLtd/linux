@@ -106,10 +106,51 @@ bool hibernation_in_progress(void)
 	return !atomic_read(&hibernate_atomic);
 }
 
+static bool hibernation_disk_relevant(struct gendisk *disk)
+{
+	return disk_live(disk) &&
+		get_capacity(disk) &&
+		disk_has_partscan(disk) &&
+		!(disk->flags & GENHD_FL_REMOVABLE);
+}
+
+static bool hibernation_storage_protected(void)
+{
+	struct class_dev_iter iter;
+	struct device *dev;
+	bool found = false;
+
+	class_dev_iter_init(&iter, &block_class, NULL, &disk_type);
+	while ((dev = class_dev_iter_next(&iter))) {
+		struct gendisk *disk = dev_to_disk(dev);
+
+		if (!hibernation_disk_relevant(disk))
+			continue;
+
+		found = true;
+		if (!disk->fops->hibernation_protected ||
+		    !disk->fops->hibernation_protected(disk)) {
+			class_dev_iter_exit(&iter);
+			return false;
+		}
+	}
+	class_dev_iter_exit(&iter);
+
+	return found;
+}
+
+static bool hibernation_lockdown_allowed(void)
+{
+	if (hibernation_storage_protected())
+		return true;
+
+	return !security_locked_down(LOCKDOWN_HIBERNATION);
+}
+
 bool hibernation_available(void)
 {
 	return nohibernate == 0 &&
-		!security_locked_down(LOCKDOWN_HIBERNATION) &&
+		hibernation_lockdown_allowed() &&
 		!secretmem_active() && !cxl_mem_active();
 }
 

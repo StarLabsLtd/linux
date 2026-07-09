@@ -579,6 +579,21 @@ static int nvme_ns_head_get_unique_id(struct gendisk *disk, u8 id[16],
 	return ret;
 }
 
+static bool nvme_ns_head_hibernation_protected(struct gendisk *disk)
+{
+	struct nvme_ns_head *head = disk->private_data;
+	struct nvme_ns *ns;
+	bool ret = false;
+	int srcu_idx;
+
+	srcu_idx = srcu_read_lock(&head->srcu);
+	ns = nvme_find_path(head);
+	if (ns)
+		ret = opal_dev_locking_enabled(ns->ctrl->opal_dev);
+	srcu_read_unlock(&head->srcu, srcu_idx);
+	return ret;
+}
+
 #ifdef CONFIG_BLK_DEV_ZONED
 static int nvme_ns_head_report_zones(struct gendisk *disk, sector_t sector,
 		unsigned int nr_zones, struct blk_report_zones_args *args)
@@ -607,6 +622,7 @@ const struct block_device_operations nvme_ns_head_ops = {
 	.compat_ioctl	= blkdev_compat_ptr_ioctl,
 	.getgeo		= nvme_getgeo,
 	.get_unique_id	= nvme_ns_head_get_unique_id,
+	.hibernation_protected = nvme_ns_head_hibernation_protected,
 	.report_zones	= nvme_ns_head_report_zones,
 	.pr_ops		= &nvme_pr_ops,
 };

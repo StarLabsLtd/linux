@@ -2629,6 +2629,13 @@ static int nvme_get_unique_id(struct gendisk *disk, u8 id[16],
 	return nvme_ns_get_unique_id(disk->private_data, id, type);
 }
 
+static bool nvme_hibernation_protected(struct gendisk *disk)
+{
+	struct nvme_ns *ns = disk->private_data;
+
+	return opal_dev_locking_enabled(ns->ctrl->opal_dev);
+}
+
 #ifdef CONFIG_BLK_SED_OPAL
 static int nvme_sec_submit(void *data, u16 spsp, u8 secp, void *buffer, size_t len,
 		bool send)
@@ -2684,6 +2691,7 @@ const struct block_device_operations nvme_bdev_ops = {
 	.release	= nvme_release,
 	.getgeo		= nvme_getgeo,
 	.get_unique_id	= nvme_get_unique_id,
+	.hibernation_protected = nvme_hibernation_protected,
 	.report_zones	= nvme_report_zones,
 	.pr_ops		= &nvme_pr_ops,
 };

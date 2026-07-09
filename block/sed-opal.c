@@ -2640,6 +2640,20 @@ err_free_dev:
 }
 EXPORT_SYMBOL(init_opal_dev);
 
+bool opal_dev_locking_enabled(struct opal_dev *dev)
+{
+	if (!dev)
+		return false;
+
+	if (check_opal_support(dev))
+		return false;
+
+	return (dev->flags & OPAL_FL_SUPPORTED) &&
+	       (dev->flags & OPAL_FL_LOCKING_SUPPORTED) &&
+	       (dev->flags & OPAL_FL_LOCKING_ENABLED);
+}
+EXPORT_SYMBOL(opal_dev_locking_enabled);
+
 static int opal_secure_erase_locking_range(struct opal_dev *dev,
 					   struct opal_session_info *opal_session)
 {
