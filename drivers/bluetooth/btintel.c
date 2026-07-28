@@ -2745,9 +2745,7 @@ static u8 btintel_classify_pkt_type(struct hci_dev *hdev, struct sk_buff *skb)
 	 * based on their connection handle value range.
 	 */
 	if (iso_capable(hdev) && hci_skb_pkt_type(skb) == HCI_ACLDATA_PKT) {
-		__u16 handle = __le16_to_cpu(hci_acl_hdr(skb)->handle);
-
-		if (hci_handle(handle) >= BTINTEL_ISODATA_HANDLE_BASE)
+		if (hci_acl_handle(skb) >= BTINTEL_ISODATA_HANDLE_BASE)
 			return HCI_ISODATA_PKT;
 	}
 
@@ -3770,6 +3768,9 @@ EXPORT_SYMBOL_GPL(btintel_configure_setup);
 static int btintel_diagnostics(struct hci_dev *hdev, struct sk_buff *skb)
 {
 	struct intel_tlv *tlv = (void *)&skb->data[5];
+
+	if (skb->len < 5 + sizeof(*tlv) + sizeof(tlv->val[0]))
+		goto recv_frame;
 
 	/* The first event is always an event type TLV */
 	if (tlv->type != INTEL_TLV_TYPE_ID)
