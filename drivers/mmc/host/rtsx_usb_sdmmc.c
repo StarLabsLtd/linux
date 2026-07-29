@@ -15,6 +15,7 @@
 #include <linux/mmc/host.h>
 #include <linux/mmc/mmc.h>
 #include <linux/mmc/sd.h>
+#include <linux/mmc/sdio.h>
 #include <linux/mmc/card.h>
 #include <linux/scatterlist.h>
 #include <linux/pm.h>
@@ -774,8 +775,11 @@ static int sdmmc_get_cd(struct mmc_host *mmc)
 	struct rtsx_usb_sdmmc *host = mmc_priv(mmc);
 	struct rtsx_ucr *ucr = host->ucr;
 	int err;
+	int int_err;
 	u16 val;
+	u8 pend;
 	bool cd;
+	bool sd_int = false;
 
 	if (host->host_removal)
 		return -ENOMEDIUM;
@@ -784,6 +788,14 @@ static int sdmmc_get_cd(struct mmc_host *mmc)
 
 	/* Check SD card detect */
 	err = rtsx_usb_get_card_status(ucr, &val);
+	if (!err) {
+		int_err = rtsx_usb_read_register(ucr, CARD_INT_PEND, &pend);
+		if (!int_err && (pend & SD_INT)) {
+			sd_int = true;
+			rtsx_usb_write_register(ucr, CARD_INT_PEND, SD_INT,
+						SD_INT);
+		}
+	}
 
 	mutex_unlock(&ucr->dev_mutex);
 
@@ -800,6 +812,9 @@ static int sdmmc_get_cd(struct mmc_host *mmc)
 		goto no_card;
 	}
 
+	if (sd_int)
+		WRITE_ONCE(host->suppress_cd, false);
+
 	if (!READ_ONCE(host->suppress_cd)) {
 		host->card_exist = true;
 		return 1;
@@ -808,11 +823,33 @@ static int sdmmc_get_cd(struct mmc_host *mmc)
 no_card:
 	/* clear OCP status */
 	if (host->ocp_stat & (MS_OCP_NOW | MS_OCP_EVER)) {
-		rtsx_usb_write_register(ucr, OCPCTL, MS_OCP_CLEAR, MS_OCP_CLEAR);
+		mutex_lock(&ucr->dev_mutex);
+		rtsx_usb_clear_ocp_status(ucr);
+		mutex_unlock(&ucr->dev_mutex);
 		host->ocp_stat = 0;
 	}
 	host->card_exist = false;
 	return 0;
+}
+
+static bool sdmmc_timeout_suppresses_cd(struct mmc_host *mmc,
+					struct mmc_command *cmd)
+{
+	if (mmc->card || cmd->error != -ETIMEDOUT)
+		return false;
+	if (cmd->retries)
+		return false;
+
+	switch (cmd->opcode) {
+	case SD_IO_RW_DIRECT:
+	case SD_IO_SEND_OP_COND:
+	case SD_SEND_IF_COND:
+	case MMC_APP_CMD:
+	case SD_APP_OP_COND:
+		return false;
+	default:
+		return true;
+	}
 }
 
 static void sdmmc_request(struct mmc_host *mmc, struct mmc_request *mrq)
@@ -882,7 +919,7 @@ finish_detect_card:
 		 * detect card when fail to update card existence state and
 		 * speed up card removal when retry
 		 */
-		if (!mmc->card && cmd->error == -ETIMEDOUT)
+		if (sdmmc_timeout_suppresses_cd(mmc, cmd))
 			WRITE_ONCE(host->suppress_cd, true);
 		sdmmc_get_cd(mmc);
 		dev_dbg(sdmmc_dev(host), "cmd->error = %d\n", cmd->error);
