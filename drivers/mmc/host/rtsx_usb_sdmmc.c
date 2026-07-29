@@ -44,6 +44,7 @@ struct rtsx_usb_sdmmc {
 	bool			double_clk;
 	bool			host_removal;
 	bool			card_exist;
+	bool			suppress_cd;
 	bool			initial_mode;
 	bool			ddr_mode;
 
@@ -774,6 +775,7 @@ static int sdmmc_get_cd(struct mmc_host *mmc)
 	struct rtsx_ucr *ucr = host->ucr;
 	int err;
 	u16 val;
+	bool cd;
 
 	if (host->host_removal)
 		return -ENOMEDIUM;
@@ -791,8 +793,14 @@ static int sdmmc_get_cd(struct mmc_host *mmc)
 
 	/* get OCP status */
 	host->ocp_stat = (val >> 4) & 0x03;
+	cd = val & SD_CD;
 
-	if (val & SD_CD) {
+	if (!cd) {
+		WRITE_ONCE(host->suppress_cd, false);
+		goto no_card;
+	}
+
+	if (!READ_ONCE(host->suppress_cd)) {
 		host->card_exist = true;
 		return 1;
 	}
@@ -800,11 +808,31 @@ static int sdmmc_get_cd(struct mmc_host *mmc)
 no_card:
 	/* clear OCP status */
 	if (host->ocp_stat & (MS_OCP_NOW | MS_OCP_EVER)) {
-		rtsx_usb_write_register(ucr, OCPCTL, MS_OCP_CLEAR, MS_OCP_CLEAR);
+		mutex_lock(&ucr->dev_mutex);
+		rtsx_usb_clear_ocp_status(ucr);
+		mutex_unlock(&ucr->dev_mutex);
 		host->ocp_stat = 0;
 	}
 	host->card_exist = false;
 	return 0;
+}
+
+static bool sdmmc_timeout_suppresses_cd(struct mmc_host *mmc,
+					struct mmc_command *cmd)
+{
+	if (mmc->card || cmd->error != -ETIMEDOUT)
+		return false;
+	if (cmd->retries)
+		return false;
+
+	switch (cmd->opcode) {
+	case SD_SEND_IF_COND:
+	case MMC_APP_CMD:
+	case SD_APP_OP_COND:
+		return false;
+	default:
+		return true;
+	}
 }
 
 static void sdmmc_request(struct mmc_host *mmc, struct mmc_request *mrq)
@@ -874,6 +902,8 @@ finish_detect_card:
 		 * detect card when fail to update card existence state and
 		 * speed up card removal when retry
 		 */
+		if (sdmmc_timeout_suppresses_cd(mmc, cmd))
+			WRITE_ONCE(host->suppress_cd, true);
 		sdmmc_get_cd(mmc);
 		dev_dbg(sdmmc_dev(host), "cmd->error = %d\n", cmd->error);
 	}
@@ -1359,6 +1389,7 @@ static void rtsx_usb_init_host(struct rtsx_usb_sdmmc *host)
 
 	host->power_mode = MMC_POWER_OFF;
 	host->ocp_stat = 0;
+	host->suppress_cd = false;
 }
 
 static int rtsx_usb_sdmmc_drv_probe(struct platform_device *pdev)
