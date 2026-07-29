@@ -823,7 +823,7 @@ no_card:
 	/* clear OCP status */
 	if (host->ocp_stat & (MS_OCP_NOW | MS_OCP_EVER)) {
 		mutex_lock(&ucr->dev_mutex);
-		rtsx_usb_write_register(ucr, OCPCTL, MS_OCP_CLEAR, MS_OCP_CLEAR);
+		rtsx_usb_clear_ocp_status(ucr);
 		mutex_unlock(&ucr->dev_mutex);
 		host->ocp_stat = 0;
 	}
