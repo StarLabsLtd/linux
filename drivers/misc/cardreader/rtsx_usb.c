@@ -9,6 +9,7 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/mutex.h>
+#include <linux/pm_runtime.h>
 #include <linux/usb.h>
 #include <linux/platform_device.h>
 #include <linux/mfd/core.h>
@@ -28,6 +29,10 @@ static const struct mfd_cell rtsx_usb_cells[] = {
 		.pdata_size = 0,
 	},
 };
+
+#ifdef CONFIG_PM
+static void rtsx_usb_status_work(struct work_struct *work);
+#endif
 
 static void rtsx_usb_sg_timed_out(struct timer_list *t)
 {
@@ -318,6 +323,18 @@ int rtsx_usb_get_card_status(struct rtsx_ucr *ucr, u16 *status)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(rtsx_usb_get_card_status);
+
+int rtsx_usb_clear_ocp_status(struct rtsx_ucr *ucr)
+{
+	int ret;
+
+	ret = rtsx_usb_write_register(ucr, OCPCTL, MS_OCP_CLEAR, MS_OCP_CLEAR);
+	if (!ret && ucr->card_status_valid)
+		ucr->card_status_cache &= ~MS_OCP_STAT_MASK;
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(rtsx_usb_clear_ocp_status);
 
 static int rtsx_usb_write_phy_register(struct rtsx_ucr *ucr, u8 addr, u8 val)
 {
@@ -655,6 +672,9 @@ static int rtsx_usb_probe(struct usb_interface *intf,
 	ucr->product_id = id->idProduct;
 
 	mutex_init(&ucr->dev_mutex);
+#ifdef CONFIG_PM
+	INIT_WORK(&ucr->status_work, rtsx_usb_status_work);
+#endif
 
 	ucr->pusb_intf = intf;
 
@@ -698,6 +718,9 @@ static void rtsx_usb_disconnect(struct usb_interface *intf)
 	dev_dbg(&intf->dev, "%s called\n", __func__);
 
 	mfd_remove_devices(&intf->dev);
+#ifdef CONFIG_PM
+	cancel_work_sync(&ucr->status_work);
+#endif
 
 	usb_set_intfdata(ucr->pusb_intf, NULL);
 
@@ -715,10 +738,43 @@ static int rtsx_usb_resume_child(struct device *dev, void *data)
 	return 0;
 }
 
+static int rtsx_usb_child_runtime_active(struct device *dev, void *data)
+{
+	bool *active = data;
+
+	if (pm_runtime_status_suspended(dev))
+		return 0;
+
+	*active = true;
+	return 1;
+}
+
+static void rtsx_usb_status_work(struct work_struct *work)
+{
+	struct rtsx_ucr *ucr = container_of(work, struct rtsx_ucr, status_work);
+	struct device *dev = &ucr->pusb_intf->dev;
+	u16 status;
+	int ret;
+
+	ret = pm_runtime_resume_and_get(dev);
+	if (ret)
+		return;
+
+	mutex_lock(&ucr->dev_mutex);
+
+	ret = rtsx_usb_get_card_status(ucr, &status);
+	if (!ret && !(status & CD_MASK) && (status & MS_OCP_STAT_MASK))
+		rtsx_usb_clear_ocp_status(ucr);
+
+	mutex_unlock(&ucr->dev_mutex);
+	pm_runtime_put(dev);
+}
+
 static int rtsx_usb_suspend(struct usb_interface *intf, pm_message_t message)
 {
 	struct rtsx_ucr *ucr =
 		(struct rtsx_ucr *)usb_get_intfdata(intf);
+	bool defer = false;
 	u16 val = 0;
 	bool valid = false;
 
@@ -732,16 +788,30 @@ static int rtsx_usb_suspend(struct usb_interface *intf, pm_message_t message)
 				val = ucr->card_status_cache;
 			mutex_unlock(&ucr->dev_mutex);
 
+			if (valid) {
+				if (val & MS_CD) {
+					schedule_work(&ucr->status_work);
+					defer = true;
+				} else if (val & SD_CD) {
+					device_for_each_child(&intf->dev, &defer,
+							      rtsx_usb_child_runtime_active);
+				} else if (val & MS_OCP_STAT_MASK) {
+					schedule_work(&ucr->status_work);
+					defer = true;
+				}
+			}
+
 			/*
 			 * Do not issue USB commands from runtime autosuspend.
 			 * Raw SD_CD is not authoritative on tray-based readers,
-			 * while a real SD card is protected by the SD/MMC child
-			 * runtime-PM reference once the card is powered. Keep
-			 * the historical Memory Stick autosuspend deferral when
-			 * the cached status says MS media is present.
+			 * so only defer for SD when the child is already active
+			 * or resuming and can acquire its own runtime-PM reference.
+			 * OCP and stale Memory Stick state need USB I/O, so
+			 * refresh them from work context.
 			 */
-			if (valid && (val & MS_CD)) {
-				device_for_each_child(&intf->dev, NULL, rtsx_usb_resume_child);
+			if (defer) {
+				device_for_each_child(&intf->dev, NULL,
+						      rtsx_usb_resume_child);
 				return -EAGAIN;
 			}
 		} else {

@@ -11,6 +11,7 @@
 #define __RTSX_USB_H
 
 #include <linux/usb.h>
+#include <linux/workqueue.h>
 
 #define DRV_NAME_RTSX_USB		"rtsx_usb"
 #define DRV_NAME_RTSX_USB_SDMMC		"rtsx_usb_sdmmc"
@@ -60,6 +61,7 @@ struct rtsx_ucr {
 	struct usb_sg_request	current_sg;
 
 	struct timer_list	sg_timer;
+	struct work_struct	status_work;
 	struct mutex		dev_mutex;
 
 	u16			card_status_cache;
@@ -71,6 +73,7 @@ struct rtsx_ucr {
 
 /* prototypes of exported functions */
 extern int rtsx_usb_get_card_status(struct rtsx_ucr *ucr, u16 *status);
+int rtsx_usb_clear_ocp_status(struct rtsx_ucr *ucr);
 
 extern int rtsx_usb_read_register(struct rtsx_ucr *ucr, u16 addr, u8 *data);
 extern int rtsx_usb_write_register(struct rtsx_ucr *ucr, u16 addr, u8 mask,
@@ -112,6 +115,7 @@ extern int rtsx_usb_card_exclusive_check(struct rtsx_ucr *ucr, int card);
 #define MS_OCP_DETECT			0x80
 #define MS_OCP_NOW			0x02
 #define MS_OCP_EVER			0x01
+#define MS_OCP_STAT_MASK		((MS_OCP_NOW | MS_OCP_EVER) << 4)
 
 /* reader command field offset & parameters */
 #define READ_REG_CMD		0
