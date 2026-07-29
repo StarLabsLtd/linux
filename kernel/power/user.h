@@ -9,6 +9,8 @@
 #include <crypto/aead.h>
 #include <crypto/aes.h>
 
+struct pid;
+
 #define SNAPSHOT_ENCRYPTION_KEY_SIZE AES_KEYSIZE_128
 #define SNAPSHOT_AUTH_TAG_SIZE 16
 
@@ -23,6 +25,7 @@ struct snapshot_data {
 	bool ready;
 	bool platform_support;
 	bool free_bitmaps;
+	bool encryption_required;
 	bool encryption_output_retired;
 	dev_t dev;
 
@@ -43,6 +46,11 @@ struct snapshot_data {
 	bool user_key_valid;
 	u64 meta_size;
 	u64 crypt_meta_size;
+	u64 crypt_swap_allocated;
+	/* Includes consumed bytes and the in-flight reservation. */
+	u64 crypt_swap_reserved;
+	loff_t swap_header_offset;
+	struct pid *owner_tgid;
 #endif
 
 };
