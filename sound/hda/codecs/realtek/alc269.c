@@ -2459,6 +2459,43 @@ static void alc269_fixup_limit_int_mic_boost(struct hda_codec *codec,
 	}
 }
 
+static void alc269_fixup_starlabs_mic_boost(struct hda_codec *codec,
+					  const struct hda_fixup *fix,
+					  int action)
+{
+	struct alc_spec *spec = codec->spec;
+	struct auto_pin_cfg *cfg = &spec->gen.autocfg;
+	int i;
+
+	if (action != HDA_FIXUP_ACT_PROBE)
+		return;
+
+	for (i = 0; i < cfg->num_inputs; i++) {
+		hda_nid_t nid = cfg->inputs[i].pin;
+		unsigned int caps, defcfg, step_cdb, steps, max_steps;
+
+		if (cfg->inputs[i].type != AUTO_PIN_MIC)
+			continue;
+		defcfg = snd_hda_codec_get_pincfg(codec, nid);
+		if (snd_hda_get_input_pin_attr(defcfg) != INPUT_PIN_ATTR_INT)
+			continue;
+
+		/* Keep the codec's gain scale, with a ceiling of 10 dB. */
+		caps = query_amp_caps(codec, nid, HDA_INPUT);
+		step_cdb = ((caps & AC_AMPCAP_STEP_SIZE) >> AC_AMPCAP_STEP_SIZE_SHIFT) + 1;
+		step_cdb *= 25;
+		steps = (caps & AC_AMPCAP_NUM_STEPS) >> AC_AMPCAP_NUM_STEPS_SHIFT;
+		max_steps = ((caps & AC_AMPCAP_OFFSET) >> AC_AMPCAP_OFFSET_SHIFT) +
+			1000 / step_cdb;
+		if (max_steps >= steps)
+			continue;
+		caps &= ~AC_AMPCAP_NUM_STEPS;
+		caps |= max_steps << AC_AMPCAP_NUM_STEPS_SHIFT;
+		if (snd_hda_override_amp_caps(codec, nid, HDA_INPUT, caps) < 0)
+			codec_warn(codec, "Failed to limit mic boost on NID 0x%x\n", nid);
+	}
+}
+
 static void alc283_hp_automute_hook(struct hda_codec *codec,
 				    struct hda_jack_callback *jack)
 {
@@ -6758,7 +6795,7 @@ static const struct hda_fixup alc269_fixups[] = {
 	},
 	[ALC269_FIXUP_STARLABS_LIMIT_INT_MIC_BOOST] = {
 		.type = HDA_FIXUP_FUNC,
-		.v.func = alc269_fixup_limit_int_mic_boost,
+		.v.func = alc269_fixup_starlabs_mic_boost,
 	},
 	[ALC233_FIXUP_STARLABS_STARFIGHTER] = {
 		.type = HDA_FIXUP_FUNC,
