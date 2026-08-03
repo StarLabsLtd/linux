@@ -3863,6 +3863,30 @@ static void alc288_fixup_surface_swap_dacs(struct hda_codec *codec,
 	spec->gen.preferred_dacs = preferred_pairs;
 }
 
+static void alc269_fixup_starlabs_horizon(struct hda_codec *codec,
+					  const struct hda_fixup *fix,
+					  int action)
+{
+	switch (action) {
+	case HDA_FIXUP_ACT_PROBE:
+		/* The ADC reports 0x17 as 0 dB; do not expose its +30 dB range. */
+		snd_hda_override_amp_caps(codec, 0x09, HDA_INPUT,
+					  (0x17 << AC_AMPCAP_OFFSET_SHIFT) |
+					  (0x17 << AC_AMPCAP_NUM_STEPS_SHIFT) |
+					  (0x02 << AC_AMPCAP_STEP_SIZE_SHIFT) |
+					  (1 << AC_AMPCAP_MUTE_SHIFT));
+		snd_hda_codec_amp_init_stereo(codec, 0x09, HDA_INPUT, 0,
+					      HDA_AMP_VOLMASK, 0x17);
+		break;
+	case HDA_FIXUP_ACT_INIT:
+		/* Values captured with the native Realtek Windows driver loaded. */
+		alc_write_coef_idx(codec, 0x04, 0xc080);
+		alc_write_coef_idx(codec, 0x0b, 0x0c0d);
+		alc_write_coef_idx(codec, 0x1a, 0xc020);
+		break;
+	}
+}
+
 enum {
 	ALC269_FIXUP_GPIO2,
 	ALC269_FIXUP_SONY_VAIO,
@@ -4171,6 +4195,7 @@ enum {
 	ALC287_FIXUP_THINKPAD_I2S_SPK,
 	ALC287_FIXUP_MG_RTKC_CSAMP_CS35L41_I2C_THINKPAD,
 	ALC2XX_FIXUP_HEADSET_MIC,
+	ALC269_FIXUP_STARLABS_HORIZON,
 	ALC289_FIXUP_DELL_CS35L41_SPI_2,
 	ALC294_FIXUP_CS35L41_I2C_2,
 	ALC256_FIXUP_ACER_SFG16_MICMUTE_LED,
@@ -6767,6 +6792,12 @@ static const struct hda_fixup alc269_fixups[] = {
 		.chained = true,
 		.chain_id = ALC269VC_FIXUP_ACER_MIC_NO_PRESENCE,
 	},
+	[ALC269_FIXUP_STARLABS_HORIZON] = {
+		.type = HDA_FIXUP_FUNC,
+		.v.func = alc269_fixup_starlabs_horizon,
+		.chained = true,
+		.chain_id = ALC269_FIXUP_LIMIT_INT_MIC_BOOST,
+	},
 	[ALC289_FIXUP_ASUS_ZEPHYRUS_DUAL_SPK] = {
 		.type = HDA_FIXUP_PINS,
 		.v.pins = (const struct hda_pintbl[]) {
@@ -8010,7 +8041,8 @@ static const struct hda_quirk alc269_fixup_tbl[] = {
 	SND_PCI_QUIRK(0x1d72, 0x1947, "RedmiBook Air", ALC255_FIXUP_XIAOMI_HEADSET_MIC),
 	SND_PCI_QUIRK(0x1e39, 0xca14, "MEDION NM14LNL", ALC233_FIXUP_MEDION_MTL_SPK),
 	SND_PCI_QUIRK(0x1e50, 0x7007, "Positivo DN50E", ALC269_FIXUP_LIMIT_INT_MIC_BOOST),
-	SND_PCI_QUIRK(0x1e50, 0x7038, "Positivo DN140", ALC269_FIXUP_LIMIT_INT_MIC_BOOST),
+	SND_PCI_QUIRK(0x1e50, 0x7038, "Star Labs StarBook Horizon / Positivo DN140",
+		      ALC269_FIXUP_STARLABS_HORIZON),
 	SND_PCI_QUIRK(0x1ee7, 0x2078, "HONOR BRB-X M1010", ALC2XX_FIXUP_HEADSET_MIC),
 	SND_PCI_QUIRK(0x1ee7, 0x2081, "HONOR MRB-XXX M1020", ALC256_FIXUP_HONOR_MRB_XXX_M1020_AUDIO),
 	SND_PCI_QUIRK(0x1f4c, 0xe001, "Minisforum V3 (SE)", ALC245_FIXUP_BASS_HP_DAC),
@@ -8155,6 +8187,7 @@ static const struct hda_model_fixup alc269_fixup_models[] = {
 	{.id = ALC271_FIXUP_HP_GATE_MIC_JACK_E1_572, .name = "acer-aspire-e1"},
 	{.id = ALC269_FIXUP_ACER_AC700, .name = "acer-ac700"},
 	{.id = ALC269_FIXUP_LIMIT_INT_MIC_BOOST, .name = "limit-mic-boost"},
+	{.id = ALC269_FIXUP_STARLABS_HORIZON, .name = "starlabs-horizon"},
 	{.id = ALC269VB_FIXUP_ASUS_ZENBOOK, .name = "asus-zenbook"},
 	{.id = ALC269VB_FIXUP_ASUS_ZENBOOK_UX31A, .name = "asus-zenbook-ux31a"},
 	{.id = ALC269VB_FIXUP_ORDISSIMO_EVE2, .name = "ordissimo"},
