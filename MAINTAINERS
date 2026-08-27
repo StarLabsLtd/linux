@@ -6661,7 +6661,7 @@ COREBOOT CFR FIRMWARE ATTRIBUTES DRIVER
 M:	Sean Rhodes <sean@starlabs.systems>
 L:	chrome-platform@lists.linux.dev
 S:	Maintained
-F:	drivers/firmware/coreboot/coreboot-cfr.c
+F:	drivers/firmware/coreboot/coreboot-cfr*
 
 COREBOOT FIRMWARE DRIVERS
 M:	Tzung-Bi Shih <tzungbi@kernel.org>
