@@ -6,6 +6,7 @@
  * runtime EFI variable-backed options through the firmware-attributes class.
  */
 
+#include <linux/acpi.h>
 #include <linux/array_size.h>
 #include <linux/bitops.h>
 #include <linux/cleanup.h>
@@ -18,7 +19,6 @@
 #include <linux/efi.h>
 #include <linux/err.h>
 #include <linux/firmware_attributes.h>
-#include <linux/io.h>
 #include <linux/kdev_t.h>
 #include <linux/kobject.h>
 #include <linux/kstrtox.h>
@@ -28,6 +28,7 @@
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/suspend.h>
 #include <linux/sysfs.h>
 #include <linux/types.h>
 
@@ -37,6 +38,7 @@
 
 #define LB_TAG_CFR_ROOT		0x47
 #define CFR_VERSION		0
+#define CFR_RUNTIME_APPLY_ACPI	2
 
 enum cfr_tags {
 	CFR_TAG_OPTION_FORM		= 1,
@@ -55,11 +57,7 @@ enum cfr_option_flags {
 	CFR_OPTFLAG_SUPPRESS	= BIT(2),
 	CFR_OPTFLAG_VOLATILE	= BIT(3),
 	CFR_OPTFLAG_RUNTIME	= BIT(4),
-};
-
-enum cfr_runtime_apply_method {
-	CFR_RUNTIME_APPLY_NONE		= 0,
-	CFR_RUNTIME_APPLY_APM_CNT	= 1,
+	CFR_OPTFLAG_LOCK_AT_BOOT	= BIT(5),
 };
 
 struct lb_cfr {
@@ -113,15 +111,12 @@ struct lb_cfr_option_form {
 	(CFR_OPTFLAG_SUPPRESS | CFR_OPTFLAG_VOLATILE)
 
 #define COREBOOT_CFR_OPT_READ_ONLY_FLAGS \
-	(CFR_OPTFLAG_READONLY | CFR_OPTFLAG_INACTIVE)
+	(CFR_OPTFLAG_READONLY | CFR_OPTFLAG_INACTIVE | CFR_OPTFLAG_LOCK_AT_BOOT)
 
 #define COREBOOT_CFR_EFI_ATTRS \
 	(EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS | \
 	 EFI_VARIABLE_RUNTIME_ACCESS)
 
-#define COREBOOT_CFR_APM_CNT_PORT	0xb2
-#define COREBOOT_CFR_APM_STS_PORT	0xb3
-#define COREBOOT_CFR_APM_APPLY_CMD	0xe3
 #define COREBOOT_CFR_MAX_FORM_DEPTH	16
 
 static efi_guid_t coreboot_cfr_guid = EFI_GUID(0xceae4c1d, 0x335b, 0x4685,
@@ -152,17 +147,18 @@ struct coreboot_cfr_setting {
 	u32 min;
 	u32 max;
 	u32 step;
-	u32 runtime_apply_method;
 	u32 runtime_apply_id;
 	bool read_only;
+	bool acpi_runtime;
 };
 
 struct coreboot_cfr_drvdata {
 	struct device *class_dev;
 	struct kset *attrs_kset;
 	struct list_head settings;
-	/* Serializes EFI variable writes and the matching runtime apply hook. */
+	/* Serializes setting access and pending_reboot. */
 	struct mutex lock;
+	acpi_handle acpi_handle;
 	bool efi_writes_supported;
 	bool pending_reboot;
 };
@@ -180,6 +176,7 @@ static struct coreboot_cfr_setting *to_coreboot_cfr_setting(struct kobject *kobj
 static bool coreboot_cfr_string_is_valid_name(const char *name)
 {
 	return name && name[0] && !strchr(name, '/') &&
+		strcmp(name, ".") != 0 && strcmp(name, "..") != 0 &&
 		strcmp(name, "pending_reboot") != 0;
 }
 
@@ -264,7 +261,6 @@ coreboot_cfr_child_string(const void *base, size_t len, u32 tag)
 static const struct lb_cfr_runtime_apply *
 coreboot_cfr_child_runtime_apply(const void *base, size_t len)
 {
-	const struct lb_cfr_runtime_apply *runtime_apply;
 	const struct coreboot_table_entry *entry;
 
 	entry = coreboot_cfr_child_entry(base, len, CFR_TAG_RUNTIME_APPLY);
@@ -272,16 +268,10 @@ coreboot_cfr_child_runtime_apply(const void *base, size_t len)
 		return ERR_CAST(entry);
 	if (!entry)
 		return NULL;
-
-	if (entry->size < sizeof(*runtime_apply))
+	if (entry->size < sizeof(struct lb_cfr_runtime_apply))
 		return ERR_PTR(-EINVAL);
 
-	runtime_apply = (const struct lb_cfr_runtime_apply *)entry;
-	if (runtime_apply->method == CFR_RUNTIME_APPLY_APM_CNT &&
-	    runtime_apply->id > U8_MAX)
-		return ERR_PTR(-EINVAL);
-
-	return runtime_apply;
+	return (const struct lb_cfr_runtime_apply *)entry;
 }
 
 static efi_char16_t *coreboot_cfr_efi_name(const char *name)
@@ -372,29 +362,102 @@ static int coreboot_cfr_write_efi_value(efi_char16_t *efi_name, u32 value,
 	return 0;
 }
 
-static int coreboot_cfr_apply_runtime(struct coreboot_cfr_setting *setting)
+static int coreboot_cfr_check_runtime(struct coreboot_cfr_setting *setting)
 {
-	u8 status;
+	union acpi_object param = {
+		.integer = { ACPI_TYPE_INTEGER, setting->runtime_apply_id },
+	};
+	struct acpi_object_list args = { 1, &param };
+	struct acpi_buffer result = { ACPI_ALLOCATE_BUFFER, NULL };
+	union acpi_object *object;
+	acpi_status status;
+	int ret = -EIO;
 
-	if (setting->runtime_apply_method != CFR_RUNTIME_APPLY_APM_CNT)
+	if (!setting->acpi_runtime || !setting->drvdata->acpi_handle)
 		return -EOPNOTSUPP;
 
-	outb((u8)setting->runtime_apply_id, COREBOOT_CFR_APM_STS_PORT);
-	outb(COREBOOT_CFR_APM_APPLY_CMD, COREBOOT_CFR_APM_CNT_PORT);
-	status = inb(COREBOOT_CFR_APM_STS_PORT);
-	if (status)
-		return -EIO;
+	status = acpi_evaluate_object(setting->drvdata->acpi_handle,
+				      "CFRD", &args, &result);
+	object = result.pointer;
+	if (ACPI_SUCCESS(status) && object) {
+		if (object->type == ACPI_TYPE_INTEGER && !object->integer.value) {
+			ret = 0;
+		} else if (object->type == ACPI_TYPE_PACKAGE &&
+			   object->package.count == 1) {
+			object = &object->package.elements[0];
+			if (object->type == ACPI_TYPE_LOCAL_REFERENCE &&
+			    object->reference.actual_type == ACPI_TYPE_DEVICE &&
+			    object->reference.handle) {
+				/* Native devices need exclusion before live access. */
+				ret = -EOPNOTSUPP;
+			}
+		}
+	}
+	ACPI_FREE(result.pointer);
+	return ret;
+}
 
-	return 0;
+static int coreboot_cfr_read_live_value(struct coreboot_cfr_setting *setting,
+					u32 *value)
+{
+	union acpi_object param = {
+		.integer = { ACPI_TYPE_INTEGER, setting->runtime_apply_id },
+	};
+	struct acpi_object_list args = { 1, &param };
+	struct acpi_buffer result = { ACPI_ALLOCATE_BUFFER, NULL };
+	union acpi_object *object;
+	acpi_status status;
+	int ret = -EIO;
+
+	status = acpi_evaluate_object(setting->drvdata->acpi_handle,
+				      "CFRG", &args, &result);
+	object = result.pointer;
+	if (ACPI_SUCCESS(status) && object && object->type == ACPI_TYPE_PACKAGE &&
+	    object->package.count == 2 &&
+	    object->package.elements[0].type == ACPI_TYPE_INTEGER &&
+	    !object->package.elements[0].integer.value &&
+	    object->package.elements[1].type == ACPI_TYPE_INTEGER &&
+	    object->package.elements[1].integer.value <= U32_MAX) {
+		*value = object->package.elements[1].integer.value;
+		ret = 0;
+	}
+	ACPI_FREE(result.pointer);
+	return ret;
+}
+
+static int coreboot_cfr_apply_runtime(struct coreboot_cfr_setting *setting,
+				      u32 value)
+{
+	union acpi_object params[] = {
+		{ .integer = { ACPI_TYPE_INTEGER, setting->runtime_apply_id } },
+		{ .integer = { ACPI_TYPE_INTEGER, value } },
+	};
+	struct acpi_object_list args = { ARRAY_SIZE(params), params };
+	struct acpi_buffer result = { ACPI_ALLOCATE_BUFFER, NULL };
+	union acpi_object *object;
+	acpi_status status;
+	int ret = -EIO;
+
+	status = acpi_evaluate_object(setting->drvdata->acpi_handle,
+				      "CFRA", &args, &result);
+	object = result.pointer;
+	if (ACPI_SUCCESS(status) && object && object->type == ACPI_TYPE_INTEGER &&
+	    !object->integer.value)
+		ret = 0;
+	ACPI_FREE(result.pointer);
+	return ret;
 }
 
 static int coreboot_cfr_write_value(struct coreboot_cfr_setting *setting,
 				    u32 value)
 {
 	efi_char16_t *efi_name;
+	unsigned int sleep_flags;
 	u32 attrs;
 	u32 old;
-	int restore_ret;
+	u32 live_value;
+	bool live;
+	bool notify;
 	int ret;
 
 	if (setting->read_only)
@@ -404,7 +467,13 @@ static int coreboot_cfr_write_value(struct coreboot_cfr_setting *setting,
 	if (IS_ERR(efi_name))
 		return PTR_ERR(efi_name);
 
+	sleep_flags = lock_system_sleep();
 	mutex_lock(&setting->drvdata->lock);
+
+	ret = coreboot_cfr_check_runtime(setting);
+	if (ret && ret != -EOPNOTSUPP)
+		goto out_unlock_mutex;
+	live = !ret;
 
 	ret = efivar_lock();
 	if (ret)
@@ -419,31 +488,31 @@ static int coreboot_cfr_write_value(struct coreboot_cfr_setting *setting,
 		goto out_unlock_efi;
 	}
 
-	if (old == value)
+	if (old == value && !live)
 		goto out_unlock_efi;
 
 	ret = coreboot_cfr_write_efi_value(efi_name, value, attrs);
 	if (ret)
 		goto out_unlock_efi;
 
-	ret = coreboot_cfr_apply_runtime(setting);
-	if (ret == -EOPNOTSUPP) {
-		/* EFI changed; firmware will consume it after reboot. */
+	if (live) {
+		ret = coreboot_cfr_apply_runtime(setting, value);
+		if (!ret)
+			ret = coreboot_cfr_read_live_value(setting, &live_value);
+		if (!ret && live_value != value)
+			ret = -EIO;
+	}
+	notify = false;
+	if (!live || ret) {
+		notify = !setting->drvdata->pending_reboot;
 		setting->drvdata->pending_reboot = true;
-		ret = 0;
-	} else if (ret) {
-		restore_ret = coreboot_cfr_write_efi_value(efi_name, old, attrs);
-		if (restore_ret) {
-			setting->drvdata->pending_reboot = true;
-			ret = restore_ret;
-		} else {
-			goto out_unlock_efi;
-		}
 	}
 
 	efivar_unlock();
-	kobject_uevent(&setting->drvdata->class_dev->kobj, KOBJ_CHANGE);
+	if (notify)
+		kobject_uevent(&setting->drvdata->class_dev->kobj, KOBJ_CHANGE);
 	mutex_unlock(&setting->drvdata->lock);
+	unlock_system_sleep(sleep_flags);
 	kfree(efi_name);
 	return ret;
 
@@ -451,6 +520,7 @@ out_unlock_efi:
 	efivar_unlock();
 out_unlock_mutex:
 	mutex_unlock(&setting->drvdata->lock);
+	unlock_system_sleep(sleep_flags);
 	kfree(efi_name);
 	return ret;
 }
@@ -498,9 +568,6 @@ static bool coreboot_cfr_value_is_valid(struct coreboot_cfr_setting *setting,
 	if (value < setting->min || value > setting->max)
 		return false;
 
-	if (!setting->step)
-		return true;
-
 	delta = value - setting->min;
 	return delta % setting->step == 0;
 }
@@ -514,13 +581,6 @@ static ssize_t type_show(struct kobject *kobj, struct kobj_attribute *attr,
 		return sysfs_emit(buf, "integer\n");
 
 	return sysfs_emit(buf, "enumeration\n");
-}
-
-static ssize_t display_name_language_code_show(struct kobject *kobj,
-					       struct kobj_attribute *attr,
-					       char *buf)
-{
-	return sysfs_emit(buf, "en_US.UTF-8\n");
 }
 
 static ssize_t display_name_show(struct kobject *kobj,
@@ -581,8 +641,6 @@ static ssize_t default_value_show(struct kobject *kobj,
 		return sysfs_emit(buf, "%u\n", setting->default_value);
 
 	label = coreboot_cfr_label_from_value(setting, setting->default_value);
-	if (!label)
-		return sysfs_emit(buf, "%u\n", setting->default_value);
 
 	return sysfs_emit(buf, "%s\n", label);
 }
@@ -592,10 +650,22 @@ static ssize_t current_value_show(struct kobject *kobj,
 {
 	struct coreboot_cfr_setting *setting = to_coreboot_cfr_setting(kobj);
 	const char *label;
+	unsigned int sleep_flags;
 	u32 value;
 	int ret;
 
-	ret = coreboot_cfr_read_value(setting, &value, NULL);
+	sleep_flags = lock_system_sleep();
+	mutex_lock(&setting->drvdata->lock);
+	ret = coreboot_cfr_check_runtime(setting);
+	if (!ret) {
+		ret = coreboot_cfr_read_live_value(setting, &value);
+		if (!ret && !coreboot_cfr_value_is_valid(setting, value))
+			ret = -EINVAL;
+	} else if (ret == -EOPNOTSUPP) {
+		ret = coreboot_cfr_read_value(setting, &value, NULL);
+	}
+	mutex_unlock(&setting->drvdata->lock);
+	unlock_system_sleep(sleep_flags);
 	if (ret)
 		return ret;
 
@@ -632,8 +702,6 @@ static ssize_t current_value_store(struct kobject *kobj,
 }
 
 static struct kobj_attribute type_attr = __ATTR_RO(type);
-static struct kobj_attribute display_name_language_code_attr =
-	__ATTR_RO(display_name_language_code);
 static struct kobj_attribute display_name_attr = __ATTR_RO(display_name);
 static struct kobj_attribute possible_values_attr = __ATTR_RO(possible_values);
 static struct kobj_attribute min_value_attr = __ATTR_RO(min_value);
@@ -644,7 +712,6 @@ static struct kobj_attribute current_value_attr = __ATTR_RW(current_value);
 
 static struct attribute *coreboot_cfr_setting_attrs[] = {
 	&type_attr.attr,
-	&display_name_language_code_attr.attr,
 	&display_name_attr.attr,
 	&possible_values_attr.attr,
 	&min_value_attr.attr,
@@ -708,10 +775,15 @@ static ssize_t pending_reboot_show(struct kobject *kobj,
 {
 	struct device *dev = kobj_to_dev(kobj->parent);
 	struct coreboot_cfr_drvdata *data;
+	bool pending_reboot;
 
 	data = dev_get_drvdata(dev);
 
-	return sysfs_emit(buf, "%d\n", data->pending_reboot);
+	mutex_lock(&data->lock);
+	pending_reboot = data->pending_reboot;
+	mutex_unlock(&data->lock);
+
+	return sysfs_emit(buf, "%d\n", pending_reboot);
 }
 
 static struct kobj_attribute pending_reboot_attr = __ATTR_RO(pending_reboot);
@@ -773,11 +845,14 @@ static int coreboot_cfr_copy_enum_values(struct coreboot_cfr_setting *setting,
 	const struct lb_cfr_varbinary *label;
 	const struct coreboot_table_entry *entry;
 	struct coreboot_cfr_enum *value;
+	unsigned int i;
 	int count;
 
 	count = coreboot_cfr_count_enum_values(base, len);
-	if (count <= 0)
-		return count ?: -EINVAL;
+	if (count < 0)
+		return count;
+	if (!count)
+		return -EOPNOTSUPP;
 
 	setting->values = kcalloc(count, sizeof(*setting->values), GFP_KERNEL);
 	if (!setting->values)
@@ -809,14 +884,15 @@ static int coreboot_cfr_copy_enum_values(struct coreboot_cfr_setting *setting,
 		value->label = coreboot_cfr_string_dup(label);
 		if (!value->label)
 			return -ENOMEM;
-		if (!coreboot_cfr_string_is_valid_label(value->label)) {
-			kfree(value->label);
-			value->label = NULL;
-			return -EINVAL;
-		}
-
 		value->value = enum_value->value;
 		setting->n_values++;
+		if (!coreboot_cfr_string_is_valid_label(value->label))
+			return -EOPNOTSUPP;
+		for (i = 0; i < setting->n_values - 1; i++) {
+			if (setting->values[i].value == value->value ||
+			    !strcmp(setting->values[i].label, value->label))
+				return -EOPNOTSUPP;
+		}
 	}
 }
 
@@ -890,6 +966,7 @@ static int coreboot_cfr_add_numeric_option(struct coreboot_cfr_drvdata *data,
 	const struct lb_cfr_runtime_apply *runtime_apply;
 	const void *child_base = option + 1;
 	struct coreboot_cfr_setting *setting;
+	struct coreboot_cfr_setting *existing;
 	size_t child_len = option->size - sizeof(*option);
 	int ret;
 
@@ -921,9 +998,8 @@ static int coreboot_cfr_add_numeric_option(struct coreboot_cfr_drvdata *data,
 		ret = PTR_ERR(runtime_apply);
 		goto err_put_setting;
 	}
-
-	if (runtime_apply && runtime_apply->method == CFR_RUNTIME_APPLY_APM_CNT) {
-		setting->runtime_apply_method = runtime_apply->method;
+	if (runtime_apply && runtime_apply->method == CFR_RUNTIME_APPLY_ACPI) {
+		setting->acpi_runtime = true;
 		setting->runtime_apply_id = runtime_apply->id;
 	}
 
@@ -945,8 +1021,14 @@ static int coreboot_cfr_add_numeric_option(struct coreboot_cfr_drvdata *data,
 	}
 
 	if (!coreboot_cfr_string_is_valid_name(setting->name)) {
-		ret = -EINVAL;
+		ret = 0;
 		goto err_put_setting;
+	}
+	list_for_each_entry(existing, &data->settings, node) {
+		if (!strcmp(existing->name, setting->name)) {
+			ret = 0;
+			goto err_put_setting;
+		}
 	}
 
 	display_name = coreboot_cfr_child_string(child_base, child_len,
@@ -961,6 +1043,10 @@ static int coreboot_cfr_add_numeric_option(struct coreboot_cfr_drvdata *data,
 		setting->display_name = kstrdup(setting->name, GFP_KERNEL);
 	if (!setting->display_name) {
 		ret = -ENOMEM;
+		goto err_put_setting;
+	}
+	if (strlen(setting->display_name) > PAGE_SIZE - 2) {
+		ret = 0;
 		goto err_put_setting;
 	}
 
@@ -989,8 +1075,15 @@ static int coreboot_cfr_add_numeric_option(struct coreboot_cfr_drvdata *data,
 		break;
 	}
 
-	if (ret)
+	if (ret) {
+		if (ret == -EOPNOTSUPP)
+			ret = 0;
 		goto err_put_setting;
+	}
+	if (!coreboot_cfr_value_is_valid(setting, setting->default_value)) {
+		ret = 0;
+		goto err_put_setting;
+	}
 	/* possible_values must be returned completely in one sysfs read. */
 	if (setting->type != COREBOOT_CFR_SETTING_NUMBER &&
 	    !coreboot_cfr_possible_values_fit(setting)) {
@@ -1106,23 +1199,29 @@ static int coreboot_cfr_probe(struct coreboot_device *dev)
 	if (root->tag != LB_TAG_CFR_ROOT || root->version != CFR_VERSION)
 		return -EINVAL;
 
-	if (root->size < sizeof(*root) || root->size > dev->entry.size)
+	if (root->size < sizeof(*root))
 		return -EINVAL;
 
 	payload_len = root->size - sizeof(*root);
 	if (crc32_be(0, root + 1, payload_len) != root->checksum)
 		return -EBADMSG;
 
-	if (!efivar_is_available())
-		return -EPROBE_DEFER;
-
 	data = devm_kzalloc(&dev->dev, sizeof(*data), GFP_KERNEL);
 	if (!data)
 		return -ENOMEM;
 
+#ifdef CONFIG_ACPI
+	data->acpi_handle = ACPI_HANDLE(dev->dev.parent);
+	if (data->acpi_handle &&
+	    (!acpi_has_method(data->acpi_handle, "CFRA") ||
+	     !acpi_has_method(data->acpi_handle, "CFRG") ||
+	     !acpi_has_method(data->acpi_handle, "CFRD")))
+		data->acpi_handle = NULL;
+#endif
+
 	ret = efivar_lock();
 	if (ret)
-		return ret;
+		return ret == -ENODEV ? -EPROBE_DEFER : ret;
 	data->efi_writes_supported = efivar_supports_writes();
 	efivar_unlock();
 
