@@ -6,6 +6,7 @@
  * runtime EFI variable-backed options through the firmware-attributes class.
  */
 
+#include <linux/acpi.h>
 #include <linux/array_size.h>
 #include <linux/bitops.h>
 #include <linux/cleanup.h>
@@ -21,11 +22,13 @@
 #include <linux/kdev_t.h>
 #include <linux/kobject.h>
 #include <linux/kstrtox.h>
+#include <linux/limits.h>
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/suspend.h>
 #include <linux/sysfs.h>
 #include <linux/types.h>
 
@@ -35,6 +38,7 @@
 
 #define LB_TAG_CFR_ROOT		0x47
 #define CFR_VERSION		0
+#define CFR_RUNTIME_APPLY_ACPI	2
 
 enum cfr_tags {
 	CFR_TAG_OPTION_FORM		= 1,
@@ -44,6 +48,7 @@ enum cfr_tags {
 	CFR_TAG_OPTION_BOOL		= 5,
 	CFR_TAG_VARCHAR_OPT_NAME	= 7,
 	CFR_TAG_VARCHAR_UI_NAME		= 8,
+	CFR_TAG_RUNTIME_APPLY		= 13,
 };
 
 enum cfr_option_flags {
@@ -72,6 +77,13 @@ struct lb_cfr_enum_value {
 	u32 tag;
 	u32 size;
 	u32 value;
+} __packed;
+
+struct lb_cfr_runtime_apply {
+	u32 tag;
+	u32 size;
+	u32 method;
+	u32 id;
 } __packed;
 
 struct lb_cfr_numeric_option {
@@ -135,15 +147,18 @@ struct coreboot_cfr_setting {
 	u32 min;
 	u32 max;
 	u32 step;
+	u32 runtime_apply_id;
 	bool read_only;
+	bool acpi_runtime;
 };
 
 struct coreboot_cfr_drvdata {
 	struct device *class_dev;
 	struct kset *attrs_kset;
 	struct list_head settings;
-	/* Serializes EFI writes and pending_reboot access. */
+	/* Serializes setting access and pending_reboot. */
 	struct mutex lock;
+	acpi_handle acpi_handle;
 	bool efi_writes_supported;
 	bool pending_reboot;
 };
@@ -243,6 +258,22 @@ coreboot_cfr_child_string(const void *base, size_t len, u32 tag)
 	return str;
 }
 
+static const struct lb_cfr_runtime_apply *
+coreboot_cfr_child_runtime_apply(const void *base, size_t len)
+{
+	const struct coreboot_table_entry *entry;
+
+	entry = coreboot_cfr_child_entry(base, len, CFR_TAG_RUNTIME_APPLY);
+	if (IS_ERR(entry))
+		return ERR_CAST(entry);
+	if (!entry)
+		return NULL;
+	if (entry->size < sizeof(struct lb_cfr_runtime_apply))
+		return ERR_PTR(-EINVAL);
+
+	return (const struct lb_cfr_runtime_apply *)entry;
+}
+
 static efi_char16_t *coreboot_cfr_efi_name(const char *name)
 {
 	size_t len, i;
@@ -331,12 +362,101 @@ static int coreboot_cfr_write_efi_value(efi_char16_t *efi_name, u32 value,
 	return 0;
 }
 
+static int coreboot_cfr_check_runtime(struct coreboot_cfr_setting *setting)
+{
+	union acpi_object param = {
+		.integer = { ACPI_TYPE_INTEGER, setting->runtime_apply_id },
+	};
+	struct acpi_object_list args = { 1, &param };
+	struct acpi_buffer result = { ACPI_ALLOCATE_BUFFER, NULL };
+	union acpi_object *object;
+	acpi_status status;
+	int ret = -EIO;
+
+	if (!setting->acpi_runtime || !setting->drvdata->acpi_handle)
+		return -EOPNOTSUPP;
+
+	status = acpi_evaluate_object(setting->drvdata->acpi_handle,
+				      "CFRD", &args, &result);
+	object = result.pointer;
+	if (ACPI_SUCCESS(status) && object) {
+		if (object->type == ACPI_TYPE_INTEGER && !object->integer.value) {
+			ret = 0;
+		} else if (object->type == ACPI_TYPE_PACKAGE &&
+			   object->package.count == 1) {
+			object = &object->package.elements[0];
+			if (object->type == ACPI_TYPE_LOCAL_REFERENCE &&
+			    object->reference.actual_type == ACPI_TYPE_DEVICE &&
+			    object->reference.handle) {
+				/* Native devices need exclusion before live access. */
+				ret = -EOPNOTSUPP;
+			}
+		}
+	}
+	ACPI_FREE(result.pointer);
+	return ret;
+}
+
+static int coreboot_cfr_read_live_value(struct coreboot_cfr_setting *setting,
+					u32 *value)
+{
+	union acpi_object param = {
+		.integer = { ACPI_TYPE_INTEGER, setting->runtime_apply_id },
+	};
+	struct acpi_object_list args = { 1, &param };
+	struct acpi_buffer result = { ACPI_ALLOCATE_BUFFER, NULL };
+	union acpi_object *object;
+	acpi_status status;
+	int ret = -EIO;
+
+	status = acpi_evaluate_object(setting->drvdata->acpi_handle,
+				      "CFRG", &args, &result);
+	object = result.pointer;
+	if (ACPI_SUCCESS(status) && object && object->type == ACPI_TYPE_PACKAGE &&
+	    object->package.count == 2 &&
+	    object->package.elements[0].type == ACPI_TYPE_INTEGER &&
+	    !object->package.elements[0].integer.value &&
+	    object->package.elements[1].type == ACPI_TYPE_INTEGER &&
+	    object->package.elements[1].integer.value <= U32_MAX) {
+		*value = object->package.elements[1].integer.value;
+		ret = 0;
+	}
+	ACPI_FREE(result.pointer);
+	return ret;
+}
+
+static int coreboot_cfr_apply_runtime(struct coreboot_cfr_setting *setting,
+				      u32 value)
+{
+	union acpi_object params[] = {
+		{ .integer = { ACPI_TYPE_INTEGER, setting->runtime_apply_id } },
+		{ .integer = { ACPI_TYPE_INTEGER, value } },
+	};
+	struct acpi_object_list args = { ARRAY_SIZE(params), params };
+	struct acpi_buffer result = { ACPI_ALLOCATE_BUFFER, NULL };
+	union acpi_object *object;
+	acpi_status status;
+	int ret = -EIO;
+
+	status = acpi_evaluate_object(setting->drvdata->acpi_handle,
+				      "CFRA", &args, &result);
+	object = result.pointer;
+	if (ACPI_SUCCESS(status) && object && object->type == ACPI_TYPE_INTEGER &&
+	    !object->integer.value)
+		ret = 0;
+	ACPI_FREE(result.pointer);
+	return ret;
+}
+
 static int coreboot_cfr_write_value(struct coreboot_cfr_setting *setting,
 				    u32 value)
 {
 	efi_char16_t *efi_name;
+	unsigned int sleep_flags;
 	u32 attrs;
 	u32 old;
+	u32 live_value;
+	bool live;
 	bool notify;
 	int ret;
 
@@ -347,7 +467,13 @@ static int coreboot_cfr_write_value(struct coreboot_cfr_setting *setting,
 	if (IS_ERR(efi_name))
 		return PTR_ERR(efi_name);
 
+	sleep_flags = lock_system_sleep();
 	mutex_lock(&setting->drvdata->lock);
+
+	ret = coreboot_cfr_check_runtime(setting);
+	if (ret && ret != -EOPNOTSUPP)
+		goto out_unlock_mutex;
+	live = !ret;
 
 	ret = efivar_lock();
 	if (ret)
@@ -362,20 +488,31 @@ static int coreboot_cfr_write_value(struct coreboot_cfr_setting *setting,
 		goto out_unlock_efi;
 	}
 
-	if (old == value)
+	if (old == value && !live)
 		goto out_unlock_efi;
 
 	ret = coreboot_cfr_write_efi_value(efi_name, value, attrs);
 	if (ret)
 		goto out_unlock_efi;
 
-	notify = !setting->drvdata->pending_reboot;
-	setting->drvdata->pending_reboot = true;
+	if (live) {
+		ret = coreboot_cfr_apply_runtime(setting, value);
+		if (!ret)
+			ret = coreboot_cfr_read_live_value(setting, &live_value);
+		if (!ret && live_value != value)
+			ret = -EIO;
+	}
+	notify = false;
+	if (!live || ret) {
+		notify = !setting->drvdata->pending_reboot;
+		setting->drvdata->pending_reboot = true;
+	}
 
 	efivar_unlock();
 	if (notify)
 		kobject_uevent(&setting->drvdata->class_dev->kobj, KOBJ_CHANGE);
 	mutex_unlock(&setting->drvdata->lock);
+	unlock_system_sleep(sleep_flags);
 	kfree(efi_name);
 	return ret;
 
@@ -383,6 +520,7 @@ out_unlock_efi:
 	efivar_unlock();
 out_unlock_mutex:
 	mutex_unlock(&setting->drvdata->lock);
+	unlock_system_sleep(sleep_flags);
 	kfree(efi_name);
 	return ret;
 }
@@ -512,10 +650,22 @@ static ssize_t current_value_show(struct kobject *kobj,
 {
 	struct coreboot_cfr_setting *setting = to_coreboot_cfr_setting(kobj);
 	const char *label;
+	unsigned int sleep_flags;
 	u32 value;
 	int ret;
 
-	ret = coreboot_cfr_read_value(setting, &value, NULL);
+	sleep_flags = lock_system_sleep();
+	mutex_lock(&setting->drvdata->lock);
+	ret = coreboot_cfr_check_runtime(setting);
+	if (!ret) {
+		ret = coreboot_cfr_read_live_value(setting, &value);
+		if (!ret && !coreboot_cfr_value_is_valid(setting, value))
+			ret = -EINVAL;
+	} else if (ret == -EOPNOTSUPP) {
+		ret = coreboot_cfr_read_value(setting, &value, NULL);
+	}
+	mutex_unlock(&setting->drvdata->lock);
+	unlock_system_sleep(sleep_flags);
 	if (ret)
 		return ret;
 
@@ -813,6 +963,7 @@ static int coreboot_cfr_add_numeric_option(struct coreboot_cfr_drvdata *data,
 {
 	const struct lb_cfr_varbinary *name;
 	const struct lb_cfr_varbinary *display_name;
+	const struct lb_cfr_runtime_apply *runtime_apply;
 	const void *child_base = option + 1;
 	struct coreboot_cfr_setting *setting;
 	struct coreboot_cfr_setting *existing;
@@ -841,6 +992,16 @@ static int coreboot_cfr_add_numeric_option(struct coreboot_cfr_drvdata *data,
 	setting->read_only =
 		(option->flags & COREBOOT_CFR_OPT_READ_ONLY_FLAGS) ||
 		!data->efi_writes_supported || parent_read_only;
+
+	runtime_apply = coreboot_cfr_child_runtime_apply(child_base, child_len);
+	if (IS_ERR(runtime_apply)) {
+		ret = PTR_ERR(runtime_apply);
+		goto err_put_setting;
+	}
+	if (runtime_apply && runtime_apply->method == CFR_RUNTIME_APPLY_ACPI) {
+		setting->acpi_runtime = true;
+		setting->runtime_apply_id = runtime_apply->id;
+	}
 
 	name = coreboot_cfr_child_string(child_base, child_len,
 					 CFR_TAG_VARCHAR_OPT_NAME);
@@ -1048,6 +1209,15 @@ static int coreboot_cfr_probe(struct coreboot_device *dev)
 	data = devm_kzalloc(&dev->dev, sizeof(*data), GFP_KERNEL);
 	if (!data)
 		return -ENOMEM;
+
+#ifdef CONFIG_ACPI
+	data->acpi_handle = ACPI_HANDLE(dev->dev.parent);
+	if (data->acpi_handle &&
+	    (!acpi_has_method(data->acpi_handle, "CFRA") ||
+	     !acpi_has_method(data->acpi_handle, "CFRG") ||
+	     !acpi_has_method(data->acpi_handle, "CFRD")))
+		data->acpi_handle = NULL;
+#endif
 
 	ret = efivar_lock();
 	if (ret)
