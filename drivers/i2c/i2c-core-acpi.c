@@ -666,6 +666,49 @@ static int acpi_gsb_i2c_write_bytes(struct i2c_client *client,
 	return (ret == 1) ? 0 : -EIO;
 }
 
+/* Raw transactions carry their complete command in the AML data buffer. */
+static int acpi_gsb_i2c_raw_transfer(struct i2c_client *client,
+				     struct gsb_buffer *gsb, u8 write_len,
+				     u8 read_len)
+{
+	struct i2c_msg msgs[2];
+	u8 *request = NULL;
+	unsigned int count = 0;
+	int ret;
+
+	if (!write_len && !read_len)
+		return -EINVAL;
+
+	if (write_len) {
+		request = kmemdup(gsb->data, write_len, GFP_KERNEL);
+		if (!request)
+			return -ENOMEM;
+		msgs[count++] = (struct i2c_msg) {
+			.addr = client->addr,
+			.flags = client->flags,
+			.len = write_len,
+			.buf = request,
+		};
+	}
+	if (read_len) {
+		msgs[count++] = (struct i2c_msg) {
+			.addr = client->addr,
+			.flags = client->flags | I2C_M_RD,
+			.len = read_len,
+			.buf = gsb->data,
+		};
+	}
+
+	ret = i2c_transfer(client->adapter, msgs, count);
+	kfree(request);
+	if (ret != count) {
+		gsb->len = 0;
+		return ret < 0 ? ret : -EIO;
+	}
+	gsb->len = read_len ? read_len : write_len;
+	return 0;
+}
+
 static acpi_status
 i2c_acpi_space_handler(u32 function, acpi_physical_address command,
 			u32 bits, u64 *value64,
@@ -765,6 +808,21 @@ i2c_acpi_space_handler(u32 function, acpi_physical_address command,
 			status = acpi_gsb_i2c_write_bytes(client, command,
 					gsb->data, info->access_length);
 		}
+		break;
+
+	case ACPI_GSB_ACCESS_ATTRIB_RAW_BYTES:
+		status = acpi_gsb_i2c_raw_transfer(client, gsb,
+						   action == ACPI_WRITE ? gsb->len : 0,
+						   action == ACPI_READ ? info->access_length : 0);
+		break;
+
+	case ACPI_GSB_ACCESS_ATTRIB_RAW_PROCESS:
+		if (action != ACPI_WRITE || !gsb->len || !info->access_length) {
+			ret = AE_BAD_PARAMETER;
+			goto err;
+		}
+		status = acpi_gsb_i2c_raw_transfer(client, gsb, gsb->len,
+						   info->access_length);
 		break;
 
 	default:
