@@ -6,6 +6,7 @@
  * runtime EFI variable-backed options through the firmware-attributes class.
  */
 
+#include <linux/acpi.h>
 #include <linux/array_size.h>
 #include <linux/bitops.h>
 #include <linux/cleanup.h>
@@ -60,6 +61,7 @@ enum cfr_option_flags {
 enum cfr_runtime_apply_method {
 	CFR_RUNTIME_APPLY_NONE		= 0,
 	CFR_RUNTIME_APPLY_APM_CNT	= 1,
+	CFR_RUNTIME_APPLY_ACPI		= 2,
 };
 
 struct lb_cfr {
@@ -158,6 +160,7 @@ struct coreboot_cfr_setting {
 };
 
 struct coreboot_cfr_drvdata {
+	acpi_handle acpi_handle;
 	struct device *class_dev;
 	struct kset *attrs_kset;
 	struct list_head settings;
@@ -372,9 +375,70 @@ static int coreboot_cfr_write_efi_value(efi_char16_t *efi_name, u32 value,
 	return 0;
 }
 
-static int coreboot_cfr_apply_runtime(struct coreboot_cfr_setting *setting)
+#ifdef CONFIG_ACPI
+static int coreboot_cfr_read_live_value(struct coreboot_cfr_setting *setting,
+				       u32 *value)
+{
+	union acpi_object param = {
+		.integer = { ACPI_TYPE_INTEGER, setting->runtime_apply_id },
+	};
+	struct acpi_object_list args = { 1, &param };
+	struct acpi_buffer result = { ACPI_ALLOCATE_BUFFER, NULL };
+	union acpi_object *object;
+	acpi_status status;
+	int ret = -EIO;
+
+	if (!setting->drvdata->acpi_handle)
+		return -ENODEV;
+
+	status = acpi_evaluate_object(setting->drvdata->acpi_handle,
+				      "CFRG", &args, &result);
+	object = result.pointer;
+	if (ACPI_SUCCESS(status) && object && object->type == ACPI_TYPE_PACKAGE &&
+	    object->package.count == 2 &&
+	    object->package.elements[0].type == ACPI_TYPE_INTEGER &&
+	    !object->package.elements[0].integer.value &&
+	    object->package.elements[1].type == ACPI_TYPE_INTEGER &&
+	    object->package.elements[1].integer.value <= U32_MAX) {
+		*value = object->package.elements[1].integer.value;
+		ret = 0;
+	}
+	ACPI_FREE(result.pointer);
+	return ret;
+}
+#else
+static int coreboot_cfr_read_live_value(struct coreboot_cfr_setting *setting,
+				       u32 *value)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
+static int coreboot_cfr_apply_runtime(struct coreboot_cfr_setting *setting,
+				      u32 value)
 {
 	u8 status;
+
+	if (setting->runtime_apply_method == CFR_RUNTIME_APPLY_ACPI) {
+#ifdef CONFIG_ACPI
+		union acpi_object params[] = {
+			{ .integer = { ACPI_TYPE_INTEGER, setting->runtime_apply_id } },
+			{ .integer = { ACPI_TYPE_INTEGER, value } },
+		};
+		struct acpi_object_list args = { ARRAY_SIZE(params), params };
+		unsigned long long result;
+		acpi_status ret;
+
+		if (!setting->drvdata->acpi_handle)
+			return -EOPNOTSUPP;
+
+		ret = acpi_evaluate_integer(setting->drvdata->acpi_handle,
+					    "CFRA", &args, &result);
+		return ACPI_FAILURE(ret) || result ? -EIO : 0;
+#else
+		return -EOPNOTSUPP;
+#endif
+	}
 
 	if (setting->runtime_apply_method != CFR_RUNTIME_APPLY_APM_CNT)
 		return -EOPNOTSUPP;
@@ -394,6 +458,7 @@ static int coreboot_cfr_write_value(struct coreboot_cfr_setting *setting,
 	efi_char16_t *efi_name;
 	u32 attrs;
 	u32 old;
+	u32 old_live;
 	int restore_ret;
 	int ret;
 
@@ -419,24 +484,38 @@ static int coreboot_cfr_write_value(struct coreboot_cfr_setting *setting,
 		goto out_unlock_efi;
 	}
 
-	if (old == value)
+	old_live = old;
+	if (setting->runtime_apply_method == CFR_RUNTIME_APPLY_ACPI &&
+	    setting->drvdata->acpi_handle) {
+		ret = coreboot_cfr_read_live_value(setting, &old_live);
+		if (ret)
+			goto out_unlock_efi;
+	}
+
+	if (old == value && (setting->runtime_apply_method != CFR_RUNTIME_APPLY_ACPI ||
+			     !setting->drvdata->acpi_handle))
 		goto out_unlock_efi;
 
 	ret = coreboot_cfr_write_efi_value(efi_name, value, attrs);
 	if (ret)
 		goto out_unlock_efi;
 
-	ret = coreboot_cfr_apply_runtime(setting);
+	ret = coreboot_cfr_apply_runtime(setting, value);
 	if (ret == -EOPNOTSUPP) {
 		/* EFI changed; firmware will consume it after reboot. */
 		setting->drvdata->pending_reboot = true;
 		ret = 0;
 	} else if (ret) {
 		restore_ret = coreboot_cfr_write_efi_value(efi_name, old, attrs);
+		if (!restore_ret)
+			restore_ret = coreboot_cfr_apply_runtime(setting, old);
+		/* The firmware applies saved preferences, not an arbitrary live snapshot. */
+		if (old_live != old)
+			setting->drvdata->pending_reboot = true;
 		if (restore_ret) {
 			setting->drvdata->pending_reboot = true;
 			ret = restore_ret;
-		} else {
+		} else if (old_live == old) {
 			goto out_unlock_efi;
 		}
 	}
@@ -595,7 +674,13 @@ static ssize_t current_value_show(struct kobject *kobj,
 	u32 value;
 	int ret;
 
-	ret = coreboot_cfr_read_value(setting, &value, NULL);
+	mutex_lock(&setting->drvdata->lock);
+	if (setting->runtime_apply_method == CFR_RUNTIME_APPLY_ACPI &&
+	    setting->drvdata->acpi_handle)
+		ret = coreboot_cfr_read_live_value(setting, &value);
+	else
+		ret = coreboot_cfr_read_value(setting, &value, NULL);
+	mutex_unlock(&setting->drvdata->lock);
 	if (ret)
 		return ret;
 
@@ -922,7 +1007,9 @@ static int coreboot_cfr_add_numeric_option(struct coreboot_cfr_drvdata *data,
 		goto err_put_setting;
 	}
 
-	if (runtime_apply && runtime_apply->method == CFR_RUNTIME_APPLY_APM_CNT) {
+	if (runtime_apply &&
+	    (runtime_apply->method == CFR_RUNTIME_APPLY_APM_CNT ||
+	     runtime_apply->method == CFR_RUNTIME_APPLY_ACPI)) {
 		setting->runtime_apply_method = runtime_apply->method;
 		setting->runtime_apply_id = runtime_apply->id;
 	}
@@ -1119,6 +1206,13 @@ static int coreboot_cfr_probe(struct coreboot_device *dev)
 	data = devm_kzalloc(&dev->dev, sizeof(*data), GFP_KERNEL);
 	if (!data)
 		return -ENOMEM;
+
+#ifdef CONFIG_ACPI
+	data->acpi_handle = ACPI_HANDLE(dev->dev.parent);
+	if (!acpi_has_method(data->acpi_handle, "CFRA") ||
+	    !acpi_has_method(data->acpi_handle, "CFRG"))
+		data->acpi_handle = NULL;
+#endif
 
 	ret = efivar_lock();
 	if (ret)
