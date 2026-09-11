@@ -53,7 +53,6 @@ config COREBOOT_CFR
 	tristate "coreboot CFR firmware attributes"
 	depends on EFI
 	depends on COREBOOT_TABLE
-	depends on HAS_IOPORT
 	select CRC32
 	select FW_ATTR_CLASS
 	help
