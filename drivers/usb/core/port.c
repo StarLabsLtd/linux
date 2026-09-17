@@ -21,18 +21,23 @@ static int usb_port_block_power_off;
 
 static const struct attribute_group *port_dev_group[];
 
-static bool usb_port_allow_power_off(struct usb_device *hdev,
-				     struct usb_hub *hub,
+static bool usb_port_allow_power_off(struct usb_hub *hub,
 				     struct usb_port *port_dev)
 {
+	struct usb_device *hdev = hub->hdev;
+
 	if (hub_is_port_power_switchable(hub))
 		return true;
 
 	if (!IS_ENABLED(CONFIG_ACPI))
 		return false;
 
+	if (hdev->parent ||
+	    !(bus_to_hcd(hdev->bus)->driver->flags & HCD_ACPI_PORT_POWER))
+		return false;
+
 	return port_dev->connect_type == USB_PORT_CONNECT_TYPE_HARD_WIRED &&
-	       usb_acpi_power_manageable(hdev, port_dev->portnum - 1);
+	       usb_acpi_port_power_manageable(port_dev);
 }
 
 static ssize_t early_stop_show(struct device *dev,
@@ -825,7 +830,7 @@ int usb_hub_create_port_device(struct usb_hub *hub, int port1)
 	 * Keep hidden the ability to enable port-poweroff if neither the
 	 * USB hub nor platform firmware can manage downstream port power.
 	 */
-	if (!usb_port_allow_power_off(hdev, hub, port_dev))
+	if (!usb_port_allow_power_off(hub, port_dev))
 		return 0;
 
 	/* Attempt to let userspace take over the policy. */

@@ -253,6 +253,7 @@ struct hc_driver {
 #define	HCD_USB32	0x0060		/* USB 3.2 */
 #define	HCD_MASK	0x0070
 #define	HCD_BH		0x0100		/* URB complete in BH context */
+#define	HCD_ACPI_PORT_POWER 0x0200	/* Root ports use ACPI power control */
 
 	/* called to init HCD and root hub */
 	int	(*reset) (struct usb_hcd *hcd);

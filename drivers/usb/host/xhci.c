@@ -5600,7 +5600,7 @@ static const struct hc_driver xhci_hc_driver = {
 	 */
 	.irq =			xhci_irq,
 	.flags =		HCD_MEMORY | HCD_DMA | HCD_USB3 | HCD_SHARED |
-				HCD_BH,
+				HCD_BH | HCD_ACPI_PORT_POWER,
 
 	/*
 	 * basic lifecycle operations
