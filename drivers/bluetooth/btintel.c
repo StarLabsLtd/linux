@@ -2205,6 +2205,7 @@ download:
 
 	calltime = ktime_get();
 
+	btintel_clear_flag(hdev, INTEL_FIRMWARE_FAILED);
 	btintel_set_flag(hdev, INTEL_DOWNLOADING);
 
 	/* Start firmware downloading and get boot parameter */
