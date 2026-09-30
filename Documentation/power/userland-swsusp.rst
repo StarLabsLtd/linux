@@ -139,6 +139,18 @@ SNAPSHOT_ENABLE_ENCRYPTION
 	exceed the number of pages returned by that ioctl. The swap header may
 	only be written at the offset supplied with SNAPSHOT_SET_SWAP_AREA.
 
+SNAPSHOT_FINALIZE_ENCRYPTED_IMAGE
+	Authenticate any buffered final chunk and finish loading the encrypted
+	image without restoring memory. Requires CAP_SYS_ADMIN, a device opened
+	for writing and enabled encryption. Takes no argument and may be called
+	before SNAPSHOT_FREEZE so a userspace counter helper can still run.
+	Returns zero only when the complete image is loaded, or ENODATA for an
+	incomplete image; authentication and loading errors are propagated.
+	Success prohibits further writes and key changes until SNAPSHOT_FREE.
+	Repeated calls after success are harmless. Userspace may then advance
+	its freshness counter before calling SNAPSHOT_ATOMIC_RESTORE, which
+	still performs finalization for callers that omit this ioctl.
+
 SNAPSHOT_SET_USER_KEY
 	Mixes additional user key material into the data portion of an encrypted
 	hibernate image. The ioctl argument points to struct uswsusp_user_key.

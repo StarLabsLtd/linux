@@ -24,6 +24,7 @@ struct snapshot_data {
 	int mode;
 	bool frozen;
 	bool ready;
+	bool image_finalized;
 	bool platform_support;
 	bool free_bitmaps;
 	bool encryption_required;

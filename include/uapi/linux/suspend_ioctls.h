@@ -58,6 +58,7 @@ struct uswsusp_user_key {
 							struct uswsusp_key_blob)
 #define SNAPSHOT_SET_USER_KEY		_IOWR(SNAPSHOT_IOC_MAGIC, 22, \
 							struct uswsusp_user_key)
-#define SNAPSHOT_IOC_MAXNR	22
+#define SNAPSHOT_FINALIZE_ENCRYPTED_IMAGE	_IO(SNAPSHOT_IOC_MAGIC, 23)
+#define SNAPSHOT_IOC_MAXNR	23
 
 #endif /* _LINUX_SUSPEND_IOCTLS_H */

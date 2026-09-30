@@ -240,6 +240,7 @@ static int snapshot_open(struct inode *inode, struct file *filp)
 	data->frozen = false;
 	data->ready = false;
 	data->platform_support = false;
+	data->image_finalized = false;
 	data->dev = 0;
 	data->encryption_required = snapshot_encryption_required(data);
 #if defined(CONFIG_ENCRYPTED_HIBERNATION)
@@ -355,6 +356,11 @@ static ssize_t snapshot_write(struct file *filp, const char __user *buf,
 	sleep_flags = lock_system_sleep();
 
 	data = filp->private_data;
+
+	if (data->image_finalized) {
+		res = -EPERM;
+		goto unlock;
+	}
 
 	if (snapshot_encryption_required(data) &&
 	    !snapshot_encryption_enabled(data)) {
@@ -517,21 +523,40 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 		}
 		break;
 
+	case SNAPSHOT_FINALIZE_ENCRYPTED_IMAGE:
+		if (data->mode != O_WRONLY ||
+		    !snapshot_encryption_enabled(data)) {
+			error = -EPERM;
+			break;
+		}
+		if (data->image_finalized)
+			break;
+		error = snapshot_finalize_decrypted_image(data);
+		if (error)
+			break;
+		error = snapshot_write_finalize(&data->handle);
+		if (!error && !snapshot_image_loaded(&data->handle))
+			error = -ENODATA;
+		if (!error)
+			data->image_finalized = true;
+		break;
+
 	case SNAPSHOT_ATOMIC_RESTORE:
 		if (snapshot_encryption_required(data) &&
 		    !snapshot_encryption_enabled(data)) {
 			error = -EPERM;
 			break;
 		}
-		if (snapshot_encryption_enabled(data)) {
-			error = snapshot_finalize_decrypted_image(data);
+		if (!data->image_finalized) {
+			if (snapshot_encryption_enabled(data)) {
+				error = snapshot_finalize_decrypted_image(data);
+				if (error)
+					break;
+			}
+			error = snapshot_write_finalize(&data->handle);
 			if (error)
 				break;
 		}
-
-		error = snapshot_write_finalize(&data->handle);
-		if (error)
-			break;
 		if (data->mode != O_WRONLY || !data->frozen) {
 			error = -EPERM;
 			break;
@@ -548,6 +573,7 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 		memset(&data->handle, 0, sizeof(struct snapshot_handle));
 		data->ready = false;
 		snapshot_teardown_encryption(data);
+		data->image_finalized = false;
 #if defined(CONFIG_ENCRYPTED_HIBERNATION)
 		snapshot_reset_swap_write_state(data, false);
 #endif
@@ -653,6 +679,10 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 		break;
 
 	case SNAPSHOT_ENABLE_ENCRYPTION:
+		if (data->image_finalized) {
+			error = -EPERM;
+			break;
+		}
 		if (data->mode == O_RDONLY)
 			error = snapshot_get_encryption_key(data, (void __user *)arg);
 		else
@@ -664,6 +694,10 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 		break;
 
 	case SNAPSHOT_SET_USER_KEY:
+		if (data->image_finalized) {
+			error = -EPERM;
+			break;
+		}
 		error = snapshot_set_user_key(data, (void __user *)arg);
 		break;
 
