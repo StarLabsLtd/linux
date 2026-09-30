@@ -169,6 +169,11 @@ SNAPSHOT_FREE_SWAP_PAGES before closing the device (in fact it will also
 unfreeze user space processes frozen by SNAPSHOT_UNFREEZE if they are
 still frozen when the device is being closed).
 
+For an encrypted restore opened for writing, closing the device restarts the
+system if encrypted input has been received and userspace is still frozen.
+If the emergency restart returns, the kernel panics. SNAPSHOT_FREE and
+SNAPSHOT_UNFREEZE remain explicit operations for cancelling the restore.
+
 Currently it is assumed that the userland utilities reading/writing the
 snapshot image from/to the kernel will use a swap partition, called the resume
 partition, or a swap file as storage space (if a swap file is used, the resume
