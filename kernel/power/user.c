@@ -260,8 +260,16 @@ static int snapshot_release(struct inode *inode, struct file *filp)
 
 	sleep_flags = lock_system_sleep();
 
-	swsusp_free();
 	data = filp->private_data;
+#if defined(CONFIG_ENCRYPTED_HIBERNATION)
+	if (data->mode == O_WRONLY && data->frozen && data->aead_tfm &&
+	    data->crypt_stream_total) {
+		pr_emerg("Encrypted hibernation restore was interrupted\n");
+		emergency_restart();
+		panic("Encrypted hibernation restore continued after emergency restart");
+	}
+#endif
+	swsusp_free();
 	data->dev = 0;
 #if defined(CONFIG_ENCRYPTED_HIBERNATION)
 	put_pid(data->owner_tgid);
