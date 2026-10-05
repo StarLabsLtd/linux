@@ -20,6 +20,7 @@
 #include <linux/scatterlist.h>
 #include <linux/pm.h>
 #include <linux/pm_runtime.h>
+#include <linux/workqueue.h>
 
 #include <linux/rtsx_usb.h>
 #include <linux/unaligned.h>
@@ -27,7 +28,6 @@
 #if defined(CONFIG_LEDS_CLASS) || (defined(CONFIG_LEDS_CLASS_MODULE) && \
 		defined(CONFIG_MMC_REALTEK_USB_MODULE))
 #include <linux/leds.h>
-#include <linux/workqueue.h>
 #define RTSX_USB_USE_LEDS_CLASS
 #endif
 
@@ -777,7 +777,7 @@ static int sdmmc_get_cd(struct mmc_host *mmc)
 	int err;
 	int int_err;
 	u16 val;
-	u8 pend;
+	u8 pend = 0;
 	bool cd;
 	bool sd_int = false;
 
@@ -800,8 +800,14 @@ static int sdmmc_get_cd(struct mmc_host *mmc)
 	mutex_unlock(&ucr->dev_mutex);
 
 	/* Treat failed detection as non-exist */
-	if (err)
+	if (err) {
+		dev_dbg(sdmmc_dev(host), "CD: status error %d\n", err);
 		goto no_card;
+	}
+
+	dev_dbg(sdmmc_dev(host),
+		"CD: status=%#x pend=%#x int_err=%d suppress=%d\n",
+		val, pend, int_err, READ_ONCE(host->suppress_cd));
 
 	/* get OCP status */
 	host->ocp_stat = (val >> 4) & 0x03;
@@ -817,6 +823,7 @@ static int sdmmc_get_cd(struct mmc_host *mmc)
 
 	if (!READ_ONCE(host->suppress_cd)) {
 		host->card_exist = true;
+		dev_dbg(sdmmc_dev(host), "CD: present\n");
 		return 1;
 	}
 
@@ -829,6 +836,8 @@ no_card:
 		host->ocp_stat = 0;
 	}
 	host->card_exist = false;
+	dev_dbg(sdmmc_dev(host), "CD: absent suppress=%d\n",
+		READ_ONCE(host->suppress_cd));
 	return 0;
 }
 
@@ -1513,6 +1522,10 @@ static int rtsx_usb_sdmmc_runtime_suspend(struct device *dev)
 	struct rtsx_usb_sdmmc *host = dev_get_drvdata(dev);
 
 	host->mmc->caps &= ~MMC_CAP_NEEDS_POLL;
+	dev_dbg(dev, "runtime suspend: pending=%d rescan=%d parent_suspended=%d\n",
+		delayed_work_pending(&host->mmc->detect),
+		current_work() == &host->mmc->detect.work,
+		pm_runtime_status_suspended(dev->parent));
 	return 0;
 }
 
@@ -1520,6 +1533,10 @@ static int rtsx_usb_sdmmc_runtime_resume(struct device *dev)
 {
 	struct rtsx_usb_sdmmc *host = dev_get_drvdata(dev);
 
+	dev_dbg(dev, "runtime resume: pending=%d rescan=%d parent_suspended=%d\n",
+		delayed_work_pending(&host->mmc->detect),
+		current_work() == &host->mmc->detect.work,
+		pm_runtime_status_suspended(dev->parent));
 	host->mmc->caps |= MMC_CAP_NEEDS_POLL;
 	if (sdmmc_get_cd(host->mmc) == 1)
 		mmc_detect_change(host->mmc, 0);
