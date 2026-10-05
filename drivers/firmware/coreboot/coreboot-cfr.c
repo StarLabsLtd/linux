@@ -143,6 +143,7 @@ struct coreboot_cfr_setting {
 	char *name;
 	char *display_name;
 	char *help_text;
+	char *display_group;
 	struct coreboot_cfr_enum *values;
 	unsigned int n_values;
 	u32 default_value;
@@ -614,6 +615,14 @@ static ssize_t display_name_show(struct kobject *kobj,
 	return sysfs_emit(buf, "%s\n", setting->display_name);
 }
 
+static ssize_t display_group_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	struct coreboot_cfr_setting *setting = to_coreboot_cfr_setting(kobj);
+
+	return sysfs_emit(buf, "%s\n", setting->display_group);
+}
+
 static ssize_t help_text_show(struct kobject *kobj,
 			      struct kobj_attribute *attr, char *buf)
 {
@@ -735,6 +744,7 @@ static ssize_t current_value_store(struct kobject *kobj,
 static struct kobj_attribute type_attr = __ATTR_RO(type);
 static struct kobj_attribute display_name_attr = __ATTR_RO(display_name);
 static struct kobj_attribute help_text_attr = __ATTR_RO(help_text);
+static struct kobj_attribute display_group_attr = __ATTR_RO(display_group);
 static struct kobj_attribute possible_values_attr = __ATTR_RO(possible_values);
 static struct kobj_attribute min_value_attr = __ATTR_RO(min_value);
 static struct kobj_attribute max_value_attr = __ATTR_RO(max_value);
@@ -746,6 +756,7 @@ static struct attribute *coreboot_cfr_setting_attrs[] = {
 	&type_attr.attr,
 	&display_name_attr.attr,
 	&help_text_attr.attr,
+	&display_group_attr.attr,
 	&possible_values_attr.attr,
 	&min_value_attr.attr,
 	&max_value_attr.attr,
@@ -759,6 +770,9 @@ static umode_t coreboot_cfr_attr_is_visible(struct kobject *kobj,
 					    struct attribute *attr, int n)
 {
 	struct coreboot_cfr_setting *setting = to_coreboot_cfr_setting(kobj);
+
+	if (attr == &display_group_attr.attr && !setting->display_group)
+		return 0;
 
 	if (attr == &help_text_attr.attr && !setting->help_text)
 		return 0;
@@ -791,6 +805,7 @@ static void coreboot_cfr_free_setting(struct coreboot_cfr_setting *setting)
 		kfree(setting->values[i].label);
 
 	kfree(setting->values);
+	kfree(setting->display_group);
 	kfree(setting->help_text);
 	kfree(setting->display_name);
 	kfree(setting->name);
@@ -996,7 +1011,8 @@ err_put_kobj:
 
 static int coreboot_cfr_add_numeric_option(struct coreboot_cfr_drvdata *data,
 					   const struct lb_cfr_numeric_option *option,
-					   bool parent_read_only)
+					   bool parent_read_only,
+					   const char *display_group)
 {
 	const struct lb_cfr_varbinary *name;
 	const struct lb_cfr_varbinary *display_name;
@@ -1020,6 +1036,14 @@ static int coreboot_cfr_add_numeric_option(struct coreboot_cfr_drvdata *data,
 	setting = kzalloc_obj(*setting, GFP_KERNEL);
 	if (!setting)
 		return -ENOMEM;
+
+	if (display_group) {
+		setting->display_group = kstrdup(display_group, GFP_KERNEL);
+		if (!setting->display_group) {
+			ret = -ENOMEM;
+			goto err_put_setting;
+		}
+	}
 
 	INIT_LIST_HEAD(&setting->node);
 	setting->drvdata = data;
@@ -1167,7 +1191,8 @@ err_put_setting:
 static int coreboot_cfr_parse_records(struct coreboot_cfr_drvdata *data,
 				      const void *base, size_t len,
 				      unsigned int depth,
-				      bool parent_read_only)
+				      bool parent_read_only,
+				      const char *display_group)
 {
 	struct coreboot_cfr_iterator iterator = {
 		.cursor = base,
@@ -1188,7 +1213,12 @@ static int coreboot_cfr_parse_records(struct coreboot_cfr_drvdata *data,
 			return 0;
 
 		switch (entry->tag) {
-		case CFR_TAG_OPTION_FORM:
+		case CFR_TAG_OPTION_FORM: {
+			const struct lb_cfr_varbinary *title;
+
+			char *label __free(kfree) = NULL;
+			char *group __free(kfree) = NULL;
+
 			if (entry->size < sizeof(struct lb_cfr_option_form))
 				return -EINVAL;
 
@@ -1202,14 +1232,36 @@ static int coreboot_cfr_parse_records(struct coreboot_cfr_drvdata *data,
 
 			child_base = form + 1;
 			child_len = entry->size - sizeof(struct lb_cfr_option_form);
+			title = coreboot_cfr_child_string(child_base, child_len,
+							  CFR_TAG_VARCHAR_UI_NAME);
+			if (IS_ERR(title))
+				return PTR_ERR(title);
+			if (title) {
+				label = coreboot_cfr_display_string_dup(title);
+				if (IS_ERR(label))
+					return PTR_ERR(no_free_ptr(label));
+			}
+			if (label) {
+				/* A display breadcrumb, not an escaped identifier path. */
+				if (display_group && strlen(display_group) +
+				    strlen(label) + 3 > PAGE_SIZE - 2)
+					return -E2BIG;
+				group = display_group ?
+					kasprintf(GFP_KERNEL, "%s / %s", display_group, label) :
+					kstrdup(label, GFP_KERNEL);
+				if (!group)
+					return -ENOMEM;
+			}
 			ret = coreboot_cfr_parse_records(data, child_base,
 							 child_len, depth + 1,
 							 parent_read_only ||
 							 (form->flags &
-							  COREBOOT_CFR_OPT_READ_ONLY_FLAGS));
+							  COREBOOT_CFR_OPT_READ_ONLY_FLAGS),
+							 group ?: display_group);
 			if (ret)
 				return ret;
 			break;
+		}
 		case CFR_TAG_OPTION_ENUM:
 		case CFR_TAG_OPTION_NUMBER:
 		case CFR_TAG_OPTION_BOOL:
@@ -1217,7 +1269,8 @@ static int coreboot_cfr_parse_records(struct coreboot_cfr_drvdata *data,
 			if (entry->size < sizeof(*option))
 				return -EINVAL;
 			ret = coreboot_cfr_add_numeric_option(data, option,
-							      parent_read_only);
+							      parent_read_only,
+							      display_group);
 			if (ret)
 				return ret;
 			break;
@@ -1303,7 +1356,7 @@ static int coreboot_cfr_probe(struct coreboot_device *dev)
 	if (ret)
 		goto err_unregister_attrs;
 
-	ret = coreboot_cfr_parse_records(data, root + 1, payload_len, 0, false);
+	ret = coreboot_cfr_parse_records(data, root + 1, payload_len, 0, false, NULL);
 	if (ret)
 		goto err_unregister_settings;
 
