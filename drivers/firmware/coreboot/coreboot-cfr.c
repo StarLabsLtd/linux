@@ -47,6 +47,7 @@ enum cfr_tags {
 	CFR_TAG_OPTION_BOOL		= 5,
 	CFR_TAG_VARCHAR_OPT_NAME	= 7,
 	CFR_TAG_VARCHAR_UI_NAME		= 8,
+	CFR_TAG_VARCHAR_UI_HELPTEXT	= 9,
 	CFR_TAG_RUNTIME_APPLY		= 13,
 };
 
@@ -148,6 +149,7 @@ struct coreboot_cfr_setting {
 	enum coreboot_cfr_setting_type type;
 	char *name;
 	char *display_name;
+	char *help_text;
 	struct coreboot_cfr_enum *values;
 	unsigned int n_values;
 	u32 default_value;
@@ -200,6 +202,27 @@ static char *coreboot_cfr_string_dup(const struct lb_cfr_varbinary *str)
 		len--;
 
 	return kmemdup_nul(data, len, GFP_KERNEL);
+}
+
+/* Optional display strings must fit completely, with newline and NUL. */
+static char *coreboot_cfr_display_string_dup(const struct lb_cfr_varbinary *str)
+{
+	const char *data = (const char *)(str + 1);
+	size_t len = str->data_length;
+	char *text;
+
+	if (len && !data[len - 1])
+		len--;
+	if (len > PAGE_SIZE - 2)
+		return ERR_PTR(-E2BIG);
+	if (memchr(data, '\0', len))
+		return ERR_PTR(-EINVAL);
+	if (!len)
+		return NULL;
+
+	text = kmemdup_nul(data, len, GFP_KERNEL);
+
+	return text ?: ERR_PTR(-ENOMEM);
 }
 
 static const struct coreboot_table_entry *
@@ -632,6 +655,14 @@ static ssize_t display_name_show(struct kobject *kobj,
 	return sysfs_emit(buf, "%s\n", setting->display_name);
 }
 
+static ssize_t help_text_show(struct kobject *kobj,
+			      struct kobj_attribute *attr, char *buf)
+{
+	struct coreboot_cfr_setting *setting = to_coreboot_cfr_setting(kobj);
+
+	return sysfs_emit(buf, "%s\n", setting->help_text);
+}
+
 static ssize_t possible_values_show(struct kobject *kobj,
 				    struct kobj_attribute *attr, char *buf)
 {
@@ -742,6 +773,7 @@ static struct kobj_attribute type_attr = __ATTR_RO(type);
 static struct kobj_attribute display_name_language_code_attr =
 	__ATTR_RO(display_name_language_code);
 static struct kobj_attribute display_name_attr = __ATTR_RO(display_name);
+static struct kobj_attribute help_text_attr = __ATTR_RO(help_text);
 static struct kobj_attribute possible_values_attr = __ATTR_RO(possible_values);
 static struct kobj_attribute min_value_attr = __ATTR_RO(min_value);
 static struct kobj_attribute max_value_attr = __ATTR_RO(max_value);
@@ -753,6 +785,7 @@ static struct attribute *coreboot_cfr_setting_attrs[] = {
 	&type_attr.attr,
 	&display_name_language_code_attr.attr,
 	&display_name_attr.attr,
+	&help_text_attr.attr,
 	&possible_values_attr.attr,
 	&min_value_attr.attr,
 	&max_value_attr.attr,
@@ -766,6 +799,9 @@ static umode_t coreboot_cfr_attr_is_visible(struct kobject *kobj,
 					    struct attribute *attr, int n)
 {
 	struct coreboot_cfr_setting *setting = to_coreboot_cfr_setting(kobj);
+
+	if (attr == &help_text_attr.attr && !setting->help_text)
+		return 0;
 
 	if (setting->type == COREBOOT_CFR_SETTING_NUMBER &&
 	    attr == &possible_values_attr.attr)
@@ -795,6 +831,7 @@ static void coreboot_cfr_free_setting(struct coreboot_cfr_setting *setting)
 		kfree(setting->values[i].label);
 
 	kfree(setting->values);
+	kfree(setting->help_text);
 	kfree(setting->display_name);
 	kfree(setting->name);
 	kfree(setting);
@@ -994,6 +1031,7 @@ static int coreboot_cfr_add_numeric_option(struct coreboot_cfr_drvdata *data,
 {
 	const struct lb_cfr_varbinary *name;
 	const struct lb_cfr_varbinary *display_name;
+	const struct lb_cfr_varbinary *help_text;
 	const struct lb_cfr_runtime_apply *runtime_apply;
 	const void *child_base = option + 1;
 	struct coreboot_cfr_setting *setting;
@@ -1071,6 +1109,21 @@ static int coreboot_cfr_add_numeric_option(struct coreboot_cfr_drvdata *data,
 	if (!setting->display_name) {
 		ret = -ENOMEM;
 		goto err_put_setting;
+	}
+
+	help_text = coreboot_cfr_child_string(child_base, child_len,
+					      CFR_TAG_VARCHAR_UI_HELPTEXT);
+	if (IS_ERR(help_text)) {
+		ret = PTR_ERR(help_text);
+		goto err_put_setting;
+	}
+	if (help_text) {
+		setting->help_text = coreboot_cfr_display_string_dup(help_text);
+		if (IS_ERR(setting->help_text)) {
+			ret = PTR_ERR(setting->help_text);
+			setting->help_text = NULL;
+			goto err_put_setting;
+		}
 	}
 
 	switch (option->tag) {
