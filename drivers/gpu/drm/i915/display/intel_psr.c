@@ -1368,12 +1368,15 @@ int _intel_psr_min_set_context_latency(const struct intel_crtc_state *crtc_state
 {
 	struct intel_display *display = to_intel_display(crtc_state);
 
-	if (!crtc_state->has_psr)
-		return 0;
-
-	/* Wa_14015401596 */
+	/*
+	 * Wa_14015401596: Keep the latency unchanged when VRR disables PSR
+	 * so the transition can use a fastset.
+	 */
 	if (intel_vrr_possible(crtc_state) && IS_DISPLAY_VER(display, 13, 14))
 		return 1;
+
+	if (!crtc_state->has_psr)
+		return 0;
 
 	/* Rest is for SRD_STATUS needed on LunarLake and onwards */
 	if (DISPLAY_VER(display) < 20)
