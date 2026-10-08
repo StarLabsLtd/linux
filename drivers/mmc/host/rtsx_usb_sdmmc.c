@@ -1533,7 +1533,8 @@ static int rtsx_usb_sdmmc_runtime_resume(struct device *dev)
 	spin_unlock_irqrestore(&mmc->lock, flags);
 
 	/* Don't restart discovery during an owned no-card operation. */
-	if (!host->host_removal && !claimed) {
+	if (!host->host_removal && !claimed &&
+	    current_work() != &mmc->detect.work) {
 		WRITE_ONCE(host->suppress_cd, false);
 		mmc_detect_change(mmc, 0);
 	}
