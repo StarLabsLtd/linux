@@ -1481,8 +1481,10 @@ static int rtsx_usb_sdmmc_runtime_resume(struct device *dev)
 	host->mmc->caps |= MMC_CAP_NEEDS_POLL;
 	/* A rescan already checks card presence after resuming the host. */
 	if (!host->host_removal &&
-	    current_work() != &host->mmc->detect.work)
+	    current_work() != &host->mmc->detect.work) {
+		WRITE_ONCE(host->suppress_cd, false);
 		mmc_detect_change(host->mmc, 0);
+	}
 	return 0;
 }
 
