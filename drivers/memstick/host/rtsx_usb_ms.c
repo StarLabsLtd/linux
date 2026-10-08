@@ -738,9 +738,11 @@ static void rtsx_usb_ms_poll_card(struct work_struct *work)
 	}
 
 	/* Clear the pending */
-	rtsx_usb_write_register(ucr, CARD_INT_PEND,
+	err = rtsx_usb_write_register(ucr, CARD_INT_PEND,
 			XD_INT | MS_INT | SD_INT,
 			XD_INT | MS_INT | SD_INT);
+	dev_dbg(ms_dev(host), "poll: ack pend=%#x mask=%#x err=%d\n",
+		val, XD_INT | MS_INT | SD_INT, err);
 
 	mutex_unlock(&ucr->dev_mutex);
 

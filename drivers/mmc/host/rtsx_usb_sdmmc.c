@@ -791,9 +791,13 @@ static int sdmmc_get_cd(struct mmc_host *mmc)
 	if (!err) {
 		int_err = rtsx_usb_read_register(ucr, CARD_INT_PEND, &pend);
 		if (!int_err && (pend & SD_INT)) {
+			int ack_err;
+
 			sd_int = true;
-			rtsx_usb_write_register(ucr, CARD_INT_PEND, SD_INT,
+			ack_err = rtsx_usb_write_register(ucr, CARD_INT_PEND, SD_INT,
 						SD_INT);
+			dev_dbg(sdmmc_dev(host), "CD: ack pend=%#x mask=%#x err=%d\n",
+				pend, SD_INT, ack_err);
 		}
 	}
 
@@ -928,8 +932,12 @@ finish_detect_card:
 		 * detect card when fail to update card existence state and
 		 * speed up card removal when retry
 		 */
-		if (sdmmc_timeout_suppresses_cd(mmc, cmd))
+		if (sdmmc_timeout_suppresses_cd(mmc, cmd)) {
+			dev_dbg(sdmmc_dev(host),
+				"CD: suppress after CMD%u err=%d power=%u\n",
+				cmd->opcode, cmd->error, host->power_mode);
 			WRITE_ONCE(host->suppress_cd, true);
+		}
 		sdmmc_get_cd(mmc);
 		dev_dbg(sdmmc_dev(host), "cmd->error = %d\n", cmd->error);
 	}
