@@ -520,6 +520,10 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 			error = put_user(in_suspend, (int __user *)arg);
 			data->ready = !freezer_test_done && !error;
 			freezer_test_done = false;
+			/* Image cleanup may sync filesystem workers. Keep users frozen. */
+			if (data->ready && !in_suspend &&
+			    snapshot_encryption_enabled(data))
+				thaw_kernel_threads();
 		}
 		break;
 
