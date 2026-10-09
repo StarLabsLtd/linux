@@ -106,7 +106,8 @@ static int snapshot_crypt_wrapped_key(struct snapshot_wrapped_key *wrapped,
 				      bool encrypt)
 {
 	u8 wrap_key[SNAPSHOT_ENCRYPTION_KEY_SIZE] __nonstring;
-	u8 buf[SNAPSHOT_ENCRYPTION_KEY_SIZE + SNAPSHOT_AUTH_TAG_SIZE] __nonstring;
+	u8 *buf;
+	size_t buf_size = SNAPSHOT_ENCRYPTION_KEY_SIZE + SNAPSHOT_AUTH_TAG_SIZE;
 	struct crypto_aead *tfm;
 	struct aead_request *req;
 	struct scatterlist sg;
@@ -137,6 +138,12 @@ static int snapshot_crypt_wrapped_key(struct snapshot_wrapped_key *wrapped,
 		goto out_tfm;
 	}
 
+	buf = kmalloc(buf_size, GFP_KERNEL);
+	if (!buf) {
+		rc = -ENOMEM;
+		goto out_req;
+	}
+
 	if (encrypt) {
 		get_random_bytes(wrapped->wrap_nonce, sizeof(wrapped->wrap_nonce));
 		memcpy(buf, image_key, SNAPSHOT_ENCRYPTION_KEY_SIZE);
@@ -146,19 +153,19 @@ static int snapshot_crypt_wrapped_key(struct snapshot_wrapped_key *wrapped,
 		       SNAPSHOT_AUTH_TAG_SIZE);
 	}
 
-	sg_init_one(&sg, buf, sizeof(buf));
+	sg_init_one(&sg, buf, buf_size);
 	aead_request_set_callback(req, 0, crypto_req_done, &wait);
 	aead_request_set_ad(req, 0);
 	aead_request_set_crypt(req, &sg, &sg,
 			       encrypt ? SNAPSHOT_ENCRYPTION_KEY_SIZE :
-					 sizeof(buf),
+					 buf_size,
 			       wrapped->wrap_nonce);
 
 	rc = crypto_wait_req(encrypt ? crypto_aead_encrypt(req) :
 				       crypto_aead_decrypt(req),
 			     &wait);
 	if (rc)
-		goto out_req;
+		goto out_buf;
 
 	if (encrypt) {
 		memcpy(wrapped->encrypted_key, buf, SNAPSHOT_ENCRYPTION_KEY_SIZE);
@@ -168,12 +175,13 @@ static int snapshot_crypt_wrapped_key(struct snapshot_wrapped_key *wrapped,
 		memcpy(image_key, buf, SNAPSHOT_ENCRYPTION_KEY_SIZE);
 	}
 
+out_buf:
+	kfree_sensitive(buf);
 out_req:
 	aead_request_free(req);
 out_tfm:
 	crypto_free_aead(tfm);
 out_key:
-	memzero_explicit(buf, sizeof(buf));
 	memzero_explicit(wrap_key, sizeof(wrap_key));
 	return rc;
 }
