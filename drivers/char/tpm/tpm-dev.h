@@ -17,6 +17,8 @@ struct file_priv {
 	ssize_t response_length;
 	bool response_read;
 	bool command_enqueued;
+	bool no_retry;
+	bool write_started;
 
 	u8 data_buffer[TPM_BUFSIZE];
 };
@@ -27,6 +29,7 @@ ssize_t tpm_common_read(struct file *file, char __user *buf,
 			size_t size, loff_t *off);
 ssize_t tpm_common_write(struct file *file, const char __user *buf,
 			 size_t size, loff_t *off);
+long tpm_common_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 __poll_t tpm_common_poll(struct file *file, poll_table *wait);
 
 void tpm_common_release(struct file *file, struct file_priv *priv);

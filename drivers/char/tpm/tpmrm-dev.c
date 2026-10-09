@@ -50,5 +50,9 @@ const struct file_operations tpmrm_fops = {
 	.read = tpm_common_read,
 	.write = tpm_common_write,
 	.poll = tpm_common_poll,
+	.unlocked_ioctl = tpm_common_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl = tpm_common_ioctl,
+#endif
 	.release = tpmrm_release,
 };

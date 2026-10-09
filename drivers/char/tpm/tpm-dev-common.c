@@ -13,6 +13,7 @@
  * Device file system interface to the TPM
  */
 #include <linux/poll.h>
+#include <uapi/linux/tpm.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
@@ -22,10 +23,19 @@
 static struct workqueue_struct *tpm_dev_wq;
 
 static ssize_t tpm_dev_transmit(struct tpm_chip *chip, struct tpm_space *space,
-				u8 *buf, size_t bufsiz)
+				u8 *buf, size_t bufsiz, bool no_retry)
 {
 	struct tpm_header *header = (void *)buf;
 	ssize_t ret, len;
+
+	/* Raw strict mode must never enter internal session/RM cleanup. */
+	if (no_retry) {
+		if (space)
+			return -EOPNOTSUPP;
+		if (tpm2_chip_auth(chip))
+			return -EBUSY;
+		return tpm_transmit_once(chip, buf, bufsiz);
+	}
 
 	if (chip->flags & TPM_CHIP_FLAG_TPM2)
 		tpm2_end_auth_session(chip);
@@ -72,7 +82,7 @@ static void tpm_dev_async_work(struct work_struct *work)
 	}
 
 	ret = tpm_dev_transmit(priv->chip, priv->space, priv->data_buffer,
-			       sizeof(priv->data_buffer));
+			       sizeof(priv->data_buffer), priv->no_retry);
 	tpm_put_ops(priv->chip);
 
 	/*
@@ -118,6 +128,8 @@ void tpm_common_open(struct file *file, struct tpm_chip *chip,
 	priv->chip = chip;
 	priv->space = space;
 	priv->response_read = true;
+	priv->no_retry = false;
+	priv->write_started = false;
 
 	mutex_init(&priv->buffer_mutex);
 	timer_setup(&priv->user_read_timer, user_reader_timeout, 0);
@@ -125,6 +137,48 @@ void tpm_common_open(struct file *file, struct tpm_chip *chip,
 	INIT_WORK(&priv->async_work, tpm_dev_async_work);
 	init_waitqueue_head(&priv->async_wait);
 	file->private_data = priv;
+}
+
+/* Sticky policy for this open description, before any driver write. */
+long tpm_common_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct file_priv *priv = file->private_data;
+	struct tpm_chip *chip = priv->chip;
+	long ret = 0;
+
+	if (cmd != TPM_IOC_SET_NO_RETRY)
+		return -ENOTTY;
+
+	mutex_lock(&priv->buffer_mutex);
+	if (priv->space) {
+		ret = -EOPNOTSUPP;
+		goto out_buffer;
+	}
+	if (priv->write_started || priv->command_enqueued ||
+	    priv->response_length || !priv->response_read) {
+		ret = -EBUSY;
+		goto out_buffer;
+	}
+
+	/* Same lock order as write; no chip_start or TPM command here. */
+	down_read(&chip->ops_sem);
+	if (!chip->ops) {
+		ret = -EPIPE;
+		goto out_ops;
+	}
+	mutex_lock(&chip->tpm_mutex);
+	if (chip->flags & (TPM_CHIP_FLAG_DISABLE | TPM_CHIP_FLAG_SUSPENDED))
+		ret = -EPIPE;
+	else if (tpm2_chip_auth(chip))
+		ret = -EBUSY;
+	else
+		priv->no_retry = true;
+	mutex_unlock(&chip->tpm_mutex);
+out_ops:
+	up_read(&chip->ops_sem);
+out_buffer:
+	mutex_unlock(&priv->buffer_mutex);
+	return ret;
 }
 
 ssize_t tpm_common_read(struct file *file, char __user *buf,
@@ -173,16 +227,19 @@ ssize_t tpm_common_write(struct file *file, const char __user *buf,
 	struct file_priv *priv = file->private_data;
 	int ret = 0;
 
-	if (size > TPM_BUFSIZE)
-		return -E2BIG;
-
 	mutex_lock(&priv->buffer_mutex);
+	priv->write_started = true;
+	if (size > TPM_BUFSIZE) {
+		ret = -E2BIG;
+		goto out;
+	}
 
 	/* Cannot perform a write until the read has cleared either via
 	 * tpm_read or a user_read_timer timeout. This also prevents split
 	 * buffered writes from blocking here.
 	 */
-	if ((!priv->response_read && priv->response_length) ||
+	if ((priv->no_retry && priv->response_length) ||
+	    (!priv->response_read && priv->response_length) ||
 	    priv->command_enqueued) {
 		ret = -EBUSY;
 		goto out;
@@ -226,7 +283,7 @@ ssize_t tpm_common_write(struct file *file, const char __user *buf,
 	}
 
 	ret = tpm_dev_transmit(priv->chip, priv->space, priv->data_buffer,
-			       sizeof(priv->data_buffer));
+			       sizeof(priv->data_buffer), priv->no_retry);
 	tpm_put_ops(priv->chip);
 
 	if (ret > 0) {

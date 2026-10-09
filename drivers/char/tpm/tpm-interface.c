@@ -184,6 +184,12 @@ out_sync:
 	return rc ? rc : len;
 }
 
+/* One command attempt; caller holds the chip ops and command locks. */
+ssize_t tpm_transmit_once(struct tpm_chip *chip, u8 *buf, size_t bufsiz)
+{
+	return tpm_try_transmit(chip, buf, bufsiz);
+}
+
 /**
  * tpm_transmit - Internal kernel interface to transmit TPM commands.
  * @chip:	a TPM chip to use

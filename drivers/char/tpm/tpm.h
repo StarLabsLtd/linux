@@ -238,6 +238,7 @@ extern const struct file_operations tpm_fops;
 extern const struct file_operations tpmrm_fops;
 extern struct idr dev_nums_idr;
 
+ssize_t tpm_transmit_once(struct tpm_chip *chip, u8 *buf, size_t bufsiz);
 ssize_t tpm_transmit(struct tpm_chip *chip, u8 *buf, size_t bufsiz);
 int tpm_get_timeouts(struct tpm_chip *);
 int tpm_auto_startup(struct tpm_chip *chip);
