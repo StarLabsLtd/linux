@@ -948,5 +948,10 @@ int snapshot_finalize_decrypted_image(struct snapshot_data *data)
 			return rc;
 	}
 
+	/* Finalization must not advance past pages absent from the stream. */
+	if (data->handle.cur <= 1 ||
+	    data->crypt_total != (u64)snapshot_get_image_size() << PAGE_SHIFT)
+		return -ENODATA;
+
 	return 0;
 }
