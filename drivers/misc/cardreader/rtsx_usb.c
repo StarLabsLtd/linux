@@ -825,7 +825,6 @@ static int rtsx_usb_suspend(struct usb_interface *intf, pm_message_t message)
 
 static int rtsx_usb_resume(struct usb_interface *intf)
 {
-	dev_dbg(&intf->dev, "resume: request child resumes\n");
 	device_for_each_child(&intf->dev, NULL, rtsx_usb_resume_child);
 	return 0;
 }
@@ -835,7 +834,6 @@ static int rtsx_usb_reset_resume(struct usb_interface *intf)
 	struct rtsx_ucr *ucr =
 		(struct rtsx_ucr *)usb_get_intfdata(intf);
 
-	dev_dbg(&intf->dev, "reset resume: reset chip and request child resumes\n");
 	rtsx_usb_reset_chip(ucr);
 	device_for_each_child(&intf->dev, NULL, rtsx_usb_resume_child);
 	return 0;
