@@ -227,6 +227,12 @@ ssize_t tpm_transmit(struct tpm_chip *chip, u8 *buf, size_t bufsiz)
 		rc = be32_to_cpu(header->return_code);
 		if (rc != TPM2_RC_RETRY && rc != TPM2_RC_TESTING)
 			break;
+		/* Retry responses must not overwrite the unsaved command payload. */
+		if (ret != TPM_HEADER_SIZE ||
+		    be16_to_cpu(header->tag) != TPM2_ST_NO_SESSIONS) {
+			ret = -EFAULT;
+			break;
+		}
 		/*
 		 * return immediately if self test returns test
 		 * still running to shorten boot time.
