@@ -47,7 +47,8 @@ static const char * const mem_sleep_labels[] = {
 };
 const char *mem_sleep_states[PM_SUSPEND_MAX];
 
-suspend_state_t mem_sleep_current = PM_SUSPEND_TO_IDLE;
+suspend_state_t mem_sleep_current = IS_ENABLED(CONFIG_PM_SLEEP_S2IDLE) ?
+	PM_SUSPEND_TO_IDLE : PM_SUSPEND_MEM;
 suspend_state_t mem_sleep_default = PM_SUSPEND_MAX;
 suspend_state_t pm_suspend_target_state;
 EXPORT_SYMBOL_GPL(pm_suspend_target_state);
@@ -187,14 +188,12 @@ static bool valid_state(suspend_state_t state)
 
 void __init pm_states_init(void)
 {
-	/* "mem" and "freeze" are always present in /sys/power/state. */
-	pm_states[PM_SUSPEND_MEM] = pm_labels[PM_SUSPEND_MEM];
-	pm_states[PM_SUSPEND_TO_IDLE] = pm_labels[PM_SUSPEND_TO_IDLE];
-	/*
-	 * Suspend-to-idle should be supported even without any suspend_ops,
-	 * initialize mem_sleep_states[] accordingly here.
-	 */
-	mem_sleep_states[PM_SUSPEND_TO_IDLE] = mem_sleep_labels[PM_SUSPEND_TO_IDLE];
+	/* Suspend-to-idle does not need platform suspend operations. */
+	if (IS_ENABLED(CONFIG_PM_SLEEP_S2IDLE)) {
+		pm_states[PM_SUSPEND_MEM] = pm_labels[PM_SUSPEND_MEM];
+		pm_states[PM_SUSPEND_TO_IDLE] = pm_labels[PM_SUSPEND_TO_IDLE];
+		mem_sleep_states[PM_SUSPEND_TO_IDLE] = mem_sleep_labels[PM_SUSPEND_TO_IDLE];
+	}
 }
 
 static int __init mem_sleep_default_setup(char *str)
@@ -202,7 +201,8 @@ static int __init mem_sleep_default_setup(char *str)
 	suspend_state_t state;
 
 	for (state = PM_SUSPEND_TO_IDLE; state <= PM_SUSPEND_MEM; state++)
-		if (mem_sleep_labels[state] &&
+		if ((state != PM_SUSPEND_TO_IDLE || IS_ENABLED(CONFIG_PM_SLEEP_S2IDLE)) &&
+		    mem_sleep_labels[state] &&
 		    !strcmp(str, mem_sleep_labels[state])) {
 			mem_sleep_default = state;
 			mem_sleep_current = state;
@@ -224,14 +224,19 @@ void suspend_set_ops(const struct platform_suspend_ops *ops)
 	sleep_flags = lock_system_sleep();
 
 	suspend_ops = ops;
+	if (!IS_ENABLED(CONFIG_PM_SLEEP_S2IDLE))
+		pm_states[PM_SUSPEND_MEM] = NULL;
 
 	if (valid_state(PM_SUSPEND_STANDBY)) {
+		pm_states[PM_SUSPEND_MEM] = pm_labels[PM_SUSPEND_MEM];
 		mem_sleep_states[PM_SUSPEND_STANDBY] = mem_sleep_labels[PM_SUSPEND_STANDBY];
 		pm_states[PM_SUSPEND_STANDBY] = pm_labels[PM_SUSPEND_STANDBY];
-		if (mem_sleep_default == PM_SUSPEND_STANDBY)
+		if (mem_sleep_default == PM_SUSPEND_STANDBY ||
+		    (!IS_ENABLED(CONFIG_PM_SLEEP_S2IDLE) && mem_sleep_default == PM_SUSPEND_MAX))
 			mem_sleep_current = PM_SUSPEND_STANDBY;
 	}
 	if (valid_state(PM_SUSPEND_MEM)) {
+		pm_states[PM_SUSPEND_MEM] = pm_labels[PM_SUSPEND_MEM];
 		mem_sleep_states[PM_SUSPEND_MEM] = mem_sleep_labels[PM_SUSPEND_MEM];
 		if (mem_sleep_default >= PM_SUSPEND_MEM)
 			mem_sleep_current = PM_SUSPEND_MEM;
@@ -257,7 +262,7 @@ EXPORT_SYMBOL_GPL(suspend_valid_only_mem);
 
 static bool sleep_state_supported(suspend_state_t state)
 {
-	return state == PM_SUSPEND_TO_IDLE ||
+	return state == PM_SUSPEND_TO_IDLE ? IS_ENABLED(CONFIG_PM_SLEEP_S2IDLE) :
 	       (valid_state(state) && !cxl_mem_active());
 }
 
@@ -637,7 +642,8 @@ int pm_suspend(suspend_state_t state)
 {
 	int error;
 
-	if (state <= PM_SUSPEND_ON || state >= PM_SUSPEND_MAX)
+	if (state <= PM_SUSPEND_ON || state >= PM_SUSPEND_MAX ||
+	    (state == PM_SUSPEND_TO_IDLE && !IS_ENABLED(CONFIG_PM_SLEEP_S2IDLE)))
 		return -EINVAL;
 
 	pr_info("suspend entry (%s)\n", mem_sleep_labels[state]);
