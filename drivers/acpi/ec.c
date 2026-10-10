@@ -823,21 +823,19 @@ static int acpi_ec_transaction(struct acpi_ec *ec, struct transaction *t)
 	if (!ec || (!t) || (t->wlen && !t->wdata) || (t->rlen && !t->rdata))
 		return -EINVAL;
 
-	mutex_lock(&ec->mutex);
+	/* Match AML LockRule fields, which acquire the Global Lock first. */
 	if (ec->global_lock) {
 		status = acpi_acquire_global_lock(ACPI_EC_UDELAY_GLK, &glk);
-		if (ACPI_FAILURE(status)) {
-			status = -ENODEV;
-			goto unlock;
-		}
+		if (ACPI_FAILURE(status))
+			return -ENODEV;
 	}
+	mutex_lock(&ec->mutex);
 
 	status = acpi_ec_transaction_unlocked(ec, t);
 
+	mutex_unlock(&ec->mutex);
 	if (ec->global_lock)
 		acpi_release_global_lock(glk);
-unlock:
-	mutex_unlock(&ec->mutex);
 	return status;
 }
 
@@ -1355,17 +1353,14 @@ acpi_ec_space_handler(u32 function, acpi_physical_address address,
 	if (function != ACPI_READ && function != ACPI_WRITE)
 		return AE_BAD_PARAMETER;
 
-	mutex_lock(&ec->mutex);
-
 	if (ec->global_lock) {
 		acpi_status status;
 
 		status = acpi_acquire_global_lock(ACPI_EC_UDELAY_GLK, &glk);
-		if (ACPI_FAILURE(status)) {
-			result = -ENODEV;
-			goto unlock;
-		}
+		if (ACPI_FAILURE(status))
+			return AE_NOT_FOUND;
 	}
+	mutex_lock(&ec->mutex);
 
 	if (ec->busy_polling || bits > 8)
 		acpi_ec_burst_enable(ec);
@@ -1381,17 +1376,13 @@ acpi_ec_space_handler(u32 function, acpi_physical_address address,
 	if (ec->busy_polling || bits > 8)
 		acpi_ec_burst_disable(ec);
 
+	mutex_unlock(&ec->mutex);
 	if (ec->global_lock)
 		acpi_release_global_lock(glk);
-
-unlock:
-	mutex_unlock(&ec->mutex);
 
 	switch (result) {
 	case -EINVAL:
 		return AE_BAD_PARAMETER;
-	case -ENODEV:
-		return AE_NOT_FOUND;
 	case -ETIME:
 		return AE_TIME;
 	case 0:
