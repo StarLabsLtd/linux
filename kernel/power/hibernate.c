@@ -1185,11 +1185,14 @@ static ssize_t disk_show(struct kobject *kobj, struct kobj_attribute *attr,
 		switch (i) {
 		case HIBERNATION_SHUTDOWN:
 		case HIBERNATION_REBOOT:
-#ifdef CONFIG_SUSPEND
-		case HIBERNATION_SUSPEND:
-#endif
 		case HIBERNATION_TEST_RESUME:
 			break;
+#ifdef CONFIG_SUSPEND
+		case HIBERNATION_SUSPEND:
+			if (pm_states[PM_SUSPEND_MEM])
+				break;
+			continue;
+#endif
 		case HIBERNATION_PLATFORM:
 			if (hibernation_ops)
 				break;
@@ -1237,12 +1240,17 @@ static ssize_t disk_store(struct kobject *kobj, struct kobj_attribute *attr,
 		switch (mode) {
 		case HIBERNATION_SHUTDOWN:
 		case HIBERNATION_REBOOT:
-#ifdef CONFIG_SUSPEND
-		case HIBERNATION_SUSPEND:
-#endif
 		case HIBERNATION_TEST_RESUME:
 			hibernation_mode = mode;
 			break;
+#ifdef CONFIG_SUSPEND
+		case HIBERNATION_SUSPEND:
+			if (pm_states[PM_SUSPEND_MEM])
+				hibernation_mode = mode;
+			else
+				error = -EINVAL;
+			break;
+#endif
 		case HIBERNATION_PLATFORM:
 			if (hibernation_ops)
 				hibernation_mode = mode;

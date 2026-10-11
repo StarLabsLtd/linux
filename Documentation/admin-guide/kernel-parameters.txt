@@ -7427,6 +7427,12 @@ Kernel parameters
 			improve throughput, but will also increase the
 			amount of memory reserved for use by the client.
 
+	s2idle=		[SUSPEND]
+			Format: off
+			Disable suspend-to-idle for this boot. Platform suspend
+			and hibernation remain available when supported. This
+			cannot be reversed after boot.
+
 	suspend.pm_test_delay=
 			[SUSPEND]
 			Sets the number of seconds to remain in a suspend test

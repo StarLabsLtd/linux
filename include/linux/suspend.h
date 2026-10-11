@@ -144,6 +144,7 @@ struct platform_s2idle_ops {
 
 #ifdef CONFIG_SUSPEND
 extern suspend_state_t pm_suspend_target_state;
+extern bool s2idle_disabled;
 extern suspend_state_t mem_sleep_current;
 extern suspend_state_t mem_sleep_default;
 

@@ -8,6 +8,15 @@ config SUSPEND
 	  powered and thus its contents are preserved, such as the
 	  suspend-to-RAM state (e.g. the ACPI S3 state).
 
+config PM_SLEEP_S2IDLE
+	bool "Suspend to idle"
+	depends on SUSPEND
+	default y
+	help
+	  Allow suspend to idle, exposed as "freeze" in /sys/power/state
+	  and "s2idle" in /sys/power/mem_sleep. Disable this when only
+	  platform suspend states should be available.
+
 config SUSPEND_FREEZER
 	bool "Enable freezer for suspend to RAM/standby" \
 		if ARCH_WANTS_FREEZER_CONTROL || BROKEN
