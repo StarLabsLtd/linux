@@ -88,6 +88,11 @@ SNAPSHOT_ALLOC_SWAP_PAGE
 SNAPSHOT_FREE_SWAP_PAGES
 	free all swap pages allocated by
 	SNAPSHOT_ALLOC_SWAP_PAGE
+	For an output that requires retirement (see SNAPSHOT_SET_USER_KEY),
+	this also acknowledges retirement, prohibits further output and thaws
+	kernel threads. Encryption remains enabled for swap-header cleanup.
+	User space must retire the image's freshness generation before this
+	call releases any swap pages. An error does not acknowledge retirement.
 
 SNAPSHOT_SET_SWAP_AREA
 	set the resume partition and the offset (in <PAGE_SIZE>
@@ -157,11 +162,28 @@ SNAPSHOT_FINALIZE_ENCRYPTED_IMAGE
 SNAPSHOT_SET_USER_KEY
 	Mixes additional user key material into the data portion of an encrypted
 	hibernate image. The ioctl argument points to struct uswsusp_user_key.
-	key_len must be between 8 and USWSUSP_USER_KEY_SIZE bytes, and reserved
-	must be zero. During hibernation the kernel writes meta_size with the
-	encrypted metadata size. During resume, userspace passes the saved
+	key_len must be between 8 and USWSUSP_USER_KEY_SIZE bytes. During
+	hibernation the kernel writes meta_size with the encrypted metadata
+	size. During resume, userspace passes the saved
 	meta_size back so the kernel can switch keys at the metadata boundary
 	before the snapshot header has been decrypted.
+
+	The reserved field accepts USWSUSP_USER_KEY_REQUIRE_RETIREMENT; all other
+	bits must be zero. This flag is only valid for an encrypted device opened
+	for reading with a selected swap area, before any ciphertext is generated.
+	Once accepted, later key calls cannot clear it. Zero preserves the usual
+	cleanup contract for encrypted callers, including non-swap backends.
+
+	After ciphertext generation starts, SNAPSHOT_FREE and SNAPSHOT_UNFREEZE
+	fail until retirement is acknowledged. New SNAPSHOT_CREATE_IMAGE calls
+	also fail while output is pending or retired.
+	SNAPSHOT_S2RAM retains the kernel-thread freeze and restricted GFP mask.
+	Closing the device without acknowledgment restarts the system before
+	teardown; this does not retire the freshness generation. User space must
+	keep the backing filesystems quiescent and enforce freshness on cold
+	restore, consuming the generation before SNAPSHOT_ATOMIC_RESTORE.
+	A successful cold restore already retires local output on return from
+	SNAPSHOT_CREATE_IMAGE and does not require another counter increment.
 
 The device's read() operation can be used to transfer the snapshot image from
 the kernel.  It has the following limitations:
@@ -174,7 +196,8 @@ the kernel.  It has the following limitations:
 The device's write() operation is used for uploading the system memory snapshot
 into the kernel.  It has the same limitations as the read() operation.
 
-The release() operation frees all memory allocated for the snapshot image
+Except for an unretired output that opted into the contract above, the
+release() operation frees all memory allocated for the snapshot image
 and all swap pages allocated with SNAPSHOT_ALLOC_SWAP_PAGE (if any).
 Thus it is not necessary to use either SNAPSHOT_FREE or
 SNAPSHOT_FREE_SWAP_PAGES before closing the device (in fact it will also

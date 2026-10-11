@@ -12,6 +12,7 @@
 #include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/swap.h>
 #include <linux/uaccess.h>
 
 #include "power.h"
@@ -620,6 +621,7 @@ static void snapshot_reset_encryption_state(struct snapshot_data *data)
 	data->meta_size = 0;
 	data->crypt_meta_size = 0;
 	data->user_key_valid = false;
+	data->encryption_retirement_required = false;
 	memset(data->auth_tag, 0, sizeof(data->auth_tag));
 }
 
@@ -851,8 +853,17 @@ int snapshot_set_user_key(struct snapshot_data *data,
 
 	BUILD_BUG_ON(sizeof(data->user_key) < sizeof(user_key.key));
 	rc = -EINVAL;
-	if (user_key.reserved)
+	if (user_key.reserved & ~USWSUSP_USER_KEY_REQUIRE_RETIREMENT)
 		goto out;
+	if (user_key.reserved & USWSUSP_USER_KEY_REQUIRE_RETIREMENT) {
+		if (data->mode != O_RDONLY || data->swap < 0 ||
+		    data->swap >= MAX_SWAPFILES)
+			goto out;
+		if (data->crypt_total || data->encryption_output_retired) {
+			rc = -EBUSY;
+			goto out;
+		}
+	}
 	if (user_key.key_len > sizeof(data->user_key))
 		goto out;
 	if (user_key.key_len < 8)
@@ -918,6 +929,8 @@ int snapshot_set_user_key(struct snapshot_data *data,
 	rc = snapshot_check_user_key_switch(data);
 	if (rc)
 		goto out;
+	if (user_key.reserved & USWSUSP_USER_KEY_REQUIRE_RETIREMENT)
+		data->encryption_retirement_required = true;
 
 	rc = 0;
 

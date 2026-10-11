@@ -162,6 +162,17 @@ static bool snapshot_encryption_required(struct snapshot_data *data)
 	return data->encryption_required;
 }
 
+static bool snapshot_output_pending(struct snapshot_data *data)
+{
+#if defined(CONFIG_ENCRYPTED_HIBERNATION)
+	/* Generated ciphertext may escape even when copy_to_user fails. */
+	return data->mode == O_RDONLY && data->encryption_retirement_required &&
+		data->crypt_total && !data->encryption_output_retired;
+#else
+	return false;
+#endif
+}
+
 static int snapshot_open(struct inode *inode, struct file *filp)
 {
 	struct snapshot_data *data;
@@ -223,6 +234,7 @@ static int snapshot_open(struct inode *inode, struct file *filp)
 	data->ready = false;
 	data->platform_support = false;
 	data->image_finalized = false;
+	data->encryption_retirement_required = false;
 	data->encryption_output_retired = false;
 	data->dev = 0;
 	data->encryption_required = snapshot_encryption_required(data);
@@ -245,6 +257,11 @@ static int snapshot_release(struct inode *inode, struct file *filp)
 	sleep_flags = lock_system_sleep();
 
 	data = filp->private_data;
+	if (snapshot_output_pending(data)) {
+		pr_emerg("Encrypted hibernation output was not retired\n");
+		emergency_restart();
+		panic("Unretired hibernation output continued after emergency restart");
+	}
 #if defined(CONFIG_ENCRYPTED_HIBERNATION)
 	if (data->mode == O_WRONLY && data->frozen && data->aead_tfm &&
 	    data->crypt_stream_total) {
@@ -442,6 +459,7 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 	struct snapshot_data *data;
 	loff_t size;
 	sector_t offset;
+	bool retire_output;
 
 	if (need_wait) {
 		wait_for_device_probe();
@@ -484,6 +502,10 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 		break;
 
 	case SNAPSHOT_UNFREEZE:
+		if (snapshot_output_pending(data)) {
+			error = -EPERM;
+			break;
+		}
 		if (!data->frozen || data->ready)
 			break;
 		pm_restore_gfp_mask();
@@ -495,7 +517,7 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 
 	case SNAPSHOT_CREATE_IMAGE:
 		if (data->mode != O_RDONLY || !data->frozen || data->ready ||
-		    data->encryption_output_retired) {
+		    data->encryption_output_retired || snapshot_output_pending(data)) {
 			error = -EPERM;
 			break;
 		}
@@ -570,6 +592,10 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 		break;
 
 	case SNAPSHOT_FREE:
+		if (snapshot_output_pending(data)) {
+			error = -EPERM;
+			break;
+		}
 		swsusp_free();
 		memset(&data->handle, 0, sizeof(struct snapshot_handle));
 		data->ready = false;
@@ -635,10 +661,18 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 			error = -ENODEV;
 			break;
 		}
+		retire_output = data->mode == O_RDONLY && data->frozen &&
+			data->encryption_retirement_required &&
+			snapshot_encryption_enabled(data);
 		free_all_swap_pages(data->swap);
 #if defined(CONFIG_ENCRYPTED_HIBERNATION)
 		snapshot_reset_swap_write_state(data, true);
 #endif
+		if (retire_output) {
+			data->encryption_output_retired = true;
+			/* Keep encryption enabled for confined header cleanup. */
+			thaw_kernel_threads();
+		}
 		break;
 
 	case SNAPSHOT_S2RAM:
@@ -657,8 +691,9 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 		 */
 		error = suspend_devices_and_enter(PM_SUSPEND_MEM);
 		data->ready = false;
-		/* Header cleanup may sync filesystem workers. Keep users frozen. */
-		if (!error && snapshot_encryption_enabled(data))
+		/* Keep workers frozen until opted-in output is retired. */
+		if (!error && snapshot_encryption_enabled(data) &&
+		    !data->encryption_retirement_required)
 			thaw_kernel_threads();
 		break;
 

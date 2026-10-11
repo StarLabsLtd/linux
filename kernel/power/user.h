@@ -27,6 +27,7 @@ struct snapshot_data {
 	bool platform_support;
 	bool free_bitmaps;
 	bool encryption_required;
+	bool encryption_retirement_required;
 	bool encryption_output_retired;
 	dev_t dev;
 

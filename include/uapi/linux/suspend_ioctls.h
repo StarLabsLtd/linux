@@ -15,6 +15,7 @@ struct resume_swap_area {
 
 #define USWSUSP_KEY_NONCE_SIZE 16
 #define USWSUSP_USER_KEY_SIZE 32
+#define USWSUSP_USER_KEY_REQUIRE_RETIREMENT (1U << 0)
 
 /*
  * This structure is used to pass the opaque wrapped hibernate image
@@ -34,6 +35,7 @@ struct uswsusp_user_key {
 	/* Kernel returns the metadata size; resume passes the saved value in. */
 	__u64 meta_size;
 	__u32 key_len;
+	/* USWSUSP_USER_KEY_* flags; unknown bits must be zero. */
 	__u32 reserved;
 	__u8 key[USWSUSP_USER_KEY_SIZE] __kernel_nonstring;
 } __attribute__((packed));
