@@ -1114,6 +1114,21 @@ static inline bool i2c_acpi_waive_d0_probe(struct device *dev)
 }
 #endif /* CONFIG_ACPI */
 
+#if IS_REACHABLE(CONFIG_I2C) && IS_ENABLED(CONFIG_ACPI_I2C_OPREGION)
+/*
+ * Caller pins the adapter/controller and holds the controller device lock,
+ * with handler installation/removal serialized by that lock. Keep this
+ * exclusion through any access relying on the result. Returns 0 for a matching
+ * handler, -EOPNOTSUPP when unavailable, or -EIO for a namespace lookup failure.
+ */
+int i2c_acpi_check_raw_handler(struct i2c_adapter *adapter);
+#else
+static inline int i2c_acpi_check_raw_handler(struct i2c_adapter *adapter)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
 static inline struct i2c_client *i2c_acpi_new_device(struct device *dev,
 						     int index,
 						     struct i2c_board_info *info)

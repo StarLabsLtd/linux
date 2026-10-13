@@ -843,6 +843,37 @@ i2c_acpi_space_handler(u32 function, acpi_physical_address command,
 }
 
 
+/* Private attachment key; I2C owns the handler data lifetime. */
+static void i2c_acpi_handler_data_key(acpi_handle handle, void *data)
+{
+}
+
+int i2c_acpi_check_raw_handler(struct i2c_adapter *adapter)
+{
+	struct i2c_acpi_handler_data *data;
+	acpi_handle handle;
+	acpi_status status;
+
+	if (!adapter->dev.parent)
+		return -EOPNOTSUPP;
+
+	device_lock_assert(adapter->dev.parent);
+	handle = ACPI_HANDLE(adapter->dev.parent);
+	if (!handle)
+		return -EOPNOTSUPP;
+
+	status = acpi_get_data(handle, i2c_acpi_handler_data_key, (void **)&data);
+	if (status == AE_NOT_FOUND)
+		return -EOPNOTSUPP;
+	if (ACPI_FAILURE(status))
+		return -EIO;
+	if (data->adapter != adapter)
+		return -EOPNOTSUPP;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(i2c_acpi_check_raw_handler);
+
 int i2c_acpi_install_space_handler(struct i2c_adapter *adapter)
 {
 	acpi_handle handle;
@@ -862,7 +893,7 @@ int i2c_acpi_install_space_handler(struct i2c_adapter *adapter)
 		return -ENOMEM;
 
 	data->adapter = adapter;
-	status = acpi_bus_attach_private_data(handle, (void *)data);
+	status = acpi_attach_data(handle, i2c_acpi_handler_data_key, data);
 	if (ACPI_FAILURE(status)) {
 		kfree(data);
 		return -ENOMEM;
@@ -875,7 +906,7 @@ int i2c_acpi_install_space_handler(struct i2c_adapter *adapter)
 				data);
 	if (ACPI_FAILURE(status)) {
 		dev_err(&adapter->dev, "Error installing i2c space handler\n");
-		acpi_bus_detach_private_data(handle);
+		acpi_detach_data(handle, i2c_acpi_handler_data_key);
 		kfree(data);
 		return -ENOMEM;
 	}
@@ -901,10 +932,10 @@ void i2c_acpi_remove_space_handler(struct i2c_adapter *adapter)
 				ACPI_ADR_SPACE_GSBUS,
 				&i2c_acpi_space_handler);
 
-	status = acpi_bus_get_private_data(handle, (void **)&data);
+	status = acpi_get_data(handle, i2c_acpi_handler_data_key, (void **)&data);
 	if (ACPI_SUCCESS(status))
 		kfree(data);
 
-	acpi_bus_detach_private_data(handle);
+	acpi_detach_data(handle, i2c_acpi_handler_data_key);
 }
 #endif /* CONFIG_ACPI_I2C_OPREGION */
