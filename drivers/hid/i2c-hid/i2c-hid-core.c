@@ -20,6 +20,7 @@
 
 #include <linux/module.h>
 #include <linux/i2c.h>
+#include <linux/i2c-hid.h>
 #include <linux/interrupt.h>
 #include <linux/input.h>
 #include <linux/irq.h>
@@ -66,6 +67,7 @@
 /* flags */
 #define I2C_HID_STARTED		0
 #define I2C_HID_RESET_PENDING	1
+#define I2C_HID_EXTERNAL_RESET_UNCERTAIN	2
 
 #define I2C_HID_PWR_ON		0x00
 #define I2C_HID_PWR_SLEEP	0x01
@@ -485,6 +487,7 @@ static int i2c_hid_start_hwreset(struct i2c_hid *ihid)
 
 		ret = i2c_hid_xfer(ihid, ihid->cmdbuf, length, NULL, 0);
 		if (ret) {
+			set_bit(I2C_HID_EXTERNAL_RESET_UNCERTAIN, &ihid->flags);
 			dev_err(&ihid->client->dev,
 				"failed to reset device: %d\n", ret);
 			break;
@@ -506,11 +509,13 @@ static int i2c_hid_finish_hwreset(struct i2c_hid *ihid)
 	i2c_hid_dbg(ihid, "%s: waiting...\n", __func__);
 
 	if (ihid->quirks & I2C_HID_QUIRK_NO_IRQ_AFTER_RESET) {
+		set_bit(I2C_HID_EXTERNAL_RESET_UNCERTAIN, &ihid->flags);
 		msleep(100);
 		clear_bit(I2C_HID_RESET_PENDING, &ihid->flags);
 	} else if (!wait_event_timeout(ihid->wait,
 				       !test_bit(I2C_HID_RESET_PENDING, &ihid->flags),
 				       msecs_to_jiffies(1000))) {
+		set_bit(I2C_HID_EXTERNAL_RESET_UNCERTAIN, &ihid->flags);
 		dev_warn(&ihid->client->dev, "device did not ack reset within 1000 ms\n");
 		clear_bit(I2C_HID_RESET_PENDING, &ihid->flags);
 	}
@@ -866,6 +871,61 @@ static const struct hid_ll_driver i2c_hid_ll_driver = {
 	.output_report = i2c_hid_output_report,
 	.raw_request = i2c_hid_raw_request,
 };
+
+int i2c_hid_begin_external_access(struct hid_device *hid)
+{
+	struct i2c_client *client;
+	struct i2c_hid *ihid;
+	int ret;
+
+	if (hid->ll_driver != &i2c_hid_ll_driver)
+		return -EOPNOTSUPP;
+
+	client = i2c_verify_client(hid->dev.parent);
+	if (!client || hid->driver_data != client)
+		return -ENODEV;
+	device_lock_assert(&client->dev);
+	device_lock_assert(&hid->dev);
+	ihid = i2c_get_clientdata(client);
+	if (!ihid || ihid->hid != hid)
+		return -ENODEV;
+	if (ihid->is_panel_follower ||
+	    (ihid->quirks & I2C_HID_QUIRK_NO_IRQ_AFTER_RESET))
+		return -EOPNOTSUPP;
+
+	ret = i2c_acpi_check_raw_handler(client->adapter);
+	if (ret)
+		return ret;
+	ret = mutex_lock_interruptible(&ihid->reset_lock);
+	if (ret)
+		return ret;
+	/* A late ACK cannot disambiguate earlier failed reset generations. */
+	if (test_bit(I2C_HID_EXTERNAL_RESET_UNCERTAIN, &ihid->flags)) {
+		ret = -EBUSY;
+		goto out_unlock_reset;
+	}
+
+	ret = mutex_lock_interruptible(&ihid->cmd_lock);
+	if (ret)
+		goto out_unlock_reset;
+
+	return 0;
+
+out_unlock_reset:
+	mutex_unlock(&ihid->reset_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(i2c_hid_begin_external_access);
+
+void i2c_hid_end_external_access(struct hid_device *hid)
+{
+	struct i2c_client *client = hid->driver_data;
+	struct i2c_hid *ihid = i2c_get_clientdata(client);
+
+	mutex_unlock(&ihid->cmd_lock);
+	mutex_unlock(&ihid->reset_lock);
+}
+EXPORT_SYMBOL_GPL(i2c_hid_end_external_access);
 
 static int i2c_hid_init_irq(struct i2c_client *client)
 {
