@@ -50,7 +50,7 @@ int snapshot_store_encryption_seed(const char *buf, size_t count)
 
 	ret = hex2bin(seed, buf, sizeof(seed));
 	if (ret)
-		return ret;
+		goto out_wipe;
 
 	mutex_lock(&snapshot_seed_mutex);
 	if (snapshot_seed_valid) {
@@ -64,6 +64,7 @@ int snapshot_store_encryption_seed(const char *buf, size_t count)
 
 out:
 	mutex_unlock(&snapshot_seed_mutex);
+out_wipe:
 	memzero_explicit(seed, sizeof(seed));
 	return ret;
 }
@@ -641,6 +642,7 @@ void snapshot_teardown_encryption(struct snapshot_data *data)
 
 	for (i = 0; i < SNAPSHOT_CHUNK_SIZE; i++) {
 		if (data->crypt_pages[i]) {
+			memzero_explicit(data->crypt_pages[i], PAGE_SIZE);
 			free_page((unsigned long)data->crypt_pages[i]);
 			data->crypt_pages[i] = NULL;
 		}
@@ -848,8 +850,10 @@ int snapshot_set_user_key(struct snapshot_data *data,
 	if (!snapshot_encryption_enabled(data))
 		return -EINVAL;
 
-	if (copy_from_user(&user_key, key, sizeof(struct uswsusp_user_key)))
-		return -EFAULT;
+	if (copy_from_user(&user_key, key, sizeof(struct uswsusp_user_key))) {
+		rc = -EFAULT;
+		goto out;
+	}
 
 	BUILD_BUG_ON(sizeof(data->user_key) < sizeof(user_key.key));
 	rc = -EINVAL;
