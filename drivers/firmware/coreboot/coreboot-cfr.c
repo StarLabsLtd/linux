@@ -19,6 +19,9 @@
 #include <linux/efi.h>
 #include <linux/err.h>
 #include <linux/firmware_attributes.h>
+#include <linux/hid.h>
+#include <linux/i2c.h>
+#include <linux/i2c-hid.h>
 #include <linux/kdev_t.h>
 #include <linux/kobject.h>
 #include <linux/kstrtox.h>
@@ -26,6 +29,7 @@
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/pm_runtime.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/suspend.h>
@@ -164,6 +168,18 @@ struct coreboot_cfr_drvdata {
 	acpi_handle acpi_handle;
 	bool efi_writes_supported;
 	bool pending_reboot;
+};
+
+/*
+ * Start zeroed. Native success owns resources until one end; failed acquisition
+ * cleans up internally, and non-native success owns no native resources.
+ */
+struct coreboot_cfr_access {
+	struct acpi_device *adev;
+	struct i2c_client *client;
+	struct i2c_adapter *adapter;
+	struct device *controller;
+	struct hid_device *hid;
 };
 
 struct coreboot_cfr_iterator {
@@ -386,7 +402,154 @@ static int coreboot_cfr_write_efi_value(efi_char16_t *efi_name, u32 value,
 	return 0;
 }
 
-static int coreboot_cfr_check_runtime(struct coreboot_cfr_setting *setting)
+#if IS_REACHABLE(CONFIG_I2C_HID_CORE) && IS_ENABLED(CONFIG_ACPI)
+static int coreboot_cfr_match_hid(struct device *dev, const void *data)
+{
+	return dev->bus == &hid_bus_type;
+}
+
+static int coreboot_cfr_begin_native_access(acpi_handle handle,
+					    struct coreboot_cfr_access *access)
+{
+	struct acpi_device *adev;
+	struct i2c_client *client;
+	struct i2c_adapter *adapter;
+	struct device *controller;
+	struct device *child;
+	struct hid_device *hid;
+	int ret;
+
+	adev = acpi_get_acpi_dev(handle);
+	if (!adev)
+		return -ENODEV;
+	client = i2c_find_device_by_fwnode(acpi_fwnode_handle(adev));
+	if (!client) {
+		ret = -ENODEV;
+		goto out_put_acpi;
+	}
+	/* Client removal drops its parent reference before the client is freed. */
+	ret = device_lock_interruptible(&client->dev);
+	if (ret)
+		goto out_put_client;
+	if (!device_is_registered(&client->dev) || !client->dev.driver ||
+	    ACPI_COMPANION(&client->dev) != adev) {
+		ret = -ENODEV;
+		device_unlock(&client->dev);
+		goto out_put_client;
+	}
+	adapter = client->adapter;
+	get_device(&adapter->dev);
+	controller = get_device(adapter->dev.parent);
+	device_unlock(&client->dev);
+	if (!controller) {
+		ret = -ENODEV;
+		goto out_put_adapter;
+	}
+	/* Controller removal waits for adapter references to be dropped. */
+	if (!device_trylock(controller)) {
+		ret = -EBUSY;
+		goto out_put_controller;
+	}
+	if (!device_is_registered(controller) || !controller->driver) {
+		ret = -ENODEV;
+		goto out_unlock_controller;
+	}
+	ret = pm_runtime_get_active(controller, RPM_TRANSPARENT);
+	if (ret)
+		goto out_unlock_controller;
+	ret = device_lock_interruptible(&client->dev);
+	if (ret)
+		goto out_put_controller_pm;
+	if (!device_is_registered(&client->dev) || !client->dev.driver ||
+	    client->adapter != adapter || adapter->dev.parent != controller ||
+	    ACPI_COMPANION(&client->dev) != adev) {
+		ret = -ENODEV;
+		goto out_unlock_client;
+	}
+	ret = pm_runtime_get_active(&client->dev, RPM_TRANSPARENT);
+	if (ret)
+		goto out_unlock_client;
+	child = device_find_child(&client->dev, NULL, coreboot_cfr_match_hid);
+	if (!child) {
+		ret = -ENODEV;
+		goto out_put_client_pm;
+	}
+	/* A child probe may need its parent; do not wait under the parent lock. */
+	if (!device_trylock(child)) {
+		ret = -EBUSY;
+		goto out_put_child;
+	}
+	hid = to_hid_device(child);
+	if (!device_is_registered(child) || !child->driver ||
+	    child->parent != &client->dev) {
+		ret = -ENODEV;
+		goto out_unlock_child;
+	}
+	ret = i2c_hid_begin_external_access(hid);
+	if (ret)
+		goto out_unlock_child;
+
+	access->adev = adev;
+	access->client = client;
+	access->adapter = adapter;
+	access->controller = controller;
+	access->hid = hid;
+	return 0;
+
+out_unlock_child:
+	device_unlock(child);
+out_put_child:
+	put_device(child);
+out_put_client_pm:
+	pm_runtime_put(&client->dev);
+out_unlock_client:
+	device_unlock(&client->dev);
+out_put_controller_pm:
+	pm_runtime_put_autosuspend(controller);
+out_unlock_controller:
+	device_unlock(controller);
+out_put_controller:
+	put_device(controller);
+out_put_adapter:
+	put_device(&adapter->dev);
+out_put_client:
+	put_device(&client->dev);
+out_put_acpi:
+	acpi_dev_put(adev);
+	return ret;
+}
+
+static void coreboot_cfr_end_access(struct coreboot_cfr_access *access)
+{
+	if (!access->hid)
+		return;
+
+	i2c_hid_end_external_access(access->hid);
+	device_unlock(&access->hid->dev);
+	put_device(&access->hid->dev);
+	pm_runtime_put(&access->client->dev);
+	device_unlock(&access->client->dev);
+	pm_runtime_put_autosuspend(access->controller);
+	device_unlock(access->controller);
+	put_device(access->controller);
+	put_device(&access->adapter->dev);
+	put_device(&access->client->dev);
+	acpi_dev_put(access->adev);
+}
+#else
+static int coreboot_cfr_begin_native_access(acpi_handle handle,
+					    struct coreboot_cfr_access *access)
+{
+	return -EOPNOTSUPP;
+}
+
+static void coreboot_cfr_end_access(struct coreboot_cfr_access *access)
+{
+}
+#endif
+
+static int coreboot_cfr_begin_access(struct coreboot_cfr_setting *setting,
+				     struct coreboot_cfr_access *access)
 {
 	union acpi_object param = {
 		.integer = { ACPI_TYPE_INTEGER, setting->runtime_apply_id },
@@ -412,8 +575,8 @@ static int coreboot_cfr_check_runtime(struct coreboot_cfr_setting *setting)
 			if (object->type == ACPI_TYPE_LOCAL_REFERENCE &&
 			    object->reference.actual_type == ACPI_TYPE_DEVICE &&
 			    object->reference.handle) {
-				/* Native devices need exclusion before live access. */
-				ret = -EOPNOTSUPP;
+				ret = coreboot_cfr_begin_native_access(
+					object->reference.handle, access);
 			}
 		}
 	}
@@ -472,13 +635,14 @@ static int coreboot_cfr_apply_runtime(struct coreboot_cfr_setting *setting,
 static int coreboot_cfr_write_value(struct coreboot_cfr_setting *setting,
 				    u32 value)
 {
+	struct coreboot_cfr_access access = {};
 	efi_char16_t *efi_name;
 	unsigned int sleep_flags;
 	u32 attrs;
 	u32 old;
 	u32 live_value;
 	bool live;
-	bool notify;
+	bool notify = false;
 	int ret;
 
 	if (setting->read_only)
@@ -491,14 +655,15 @@ static int coreboot_cfr_write_value(struct coreboot_cfr_setting *setting,
 	sleep_flags = lock_system_sleep();
 	mutex_lock(&setting->drvdata->lock);
 
-	ret = coreboot_cfr_check_runtime(setting);
+	ret = coreboot_cfr_begin_access(setting, &access);
+	/* Only unavailable native support permits persistence-only access. */
 	if (ret && ret != -EOPNOTSUPP)
 		goto out_unlock_mutex;
 	live = !ret;
 
 	ret = efivar_lock();
 	if (ret)
-		goto out_unlock_mutex;
+		goto out_end_access;
 
 	ret = coreboot_cfr_read_efi_value(efi_name, &old, &attrs);
 	if (ret)
@@ -523,25 +688,20 @@ static int coreboot_cfr_write_value(struct coreboot_cfr_setting *setting,
 		if (!ret && live_value != value)
 			ret = -EIO;
 	}
-	notify = false;
 	if (!live || ret) {
 		notify = !setting->drvdata->pending_reboot;
 		setting->drvdata->pending_reboot = true;
 	}
 
-	efivar_unlock();
-	if (notify)
-		kobject_uevent(&setting->drvdata->class_dev->kobj, KOBJ_CHANGE);
-	mutex_unlock(&setting->drvdata->lock);
-	unlock_system_sleep(sleep_flags);
-	kfree(efi_name);
-	return ret;
-
 out_unlock_efi:
 	efivar_unlock();
+out_end_access:
+	coreboot_cfr_end_access(&access);
 out_unlock_mutex:
 	mutex_unlock(&setting->drvdata->lock);
 	unlock_system_sleep(sleep_flags);
+	if (notify)
+		kobject_uevent(&setting->drvdata->class_dev->kobj, KOBJ_CHANGE);
 	kfree(efi_name);
 	return ret;
 }
@@ -686,6 +846,7 @@ static ssize_t current_value_show(struct kobject *kobj,
 				  struct kobj_attribute *attr, char *buf)
 {
 	struct coreboot_cfr_setting *setting = to_coreboot_cfr_setting(kobj);
+	struct coreboot_cfr_access access = {};
 	const char *label;
 	unsigned int sleep_flags;
 	u32 value;
@@ -693,7 +854,7 @@ static ssize_t current_value_show(struct kobject *kobj,
 
 	sleep_flags = lock_system_sleep();
 	mutex_lock(&setting->drvdata->lock);
-	ret = coreboot_cfr_check_runtime(setting);
+	ret = coreboot_cfr_begin_access(setting, &access);
 	if (!ret) {
 		ret = coreboot_cfr_read_live_value(setting, &value);
 		if (!ret && !coreboot_cfr_value_is_valid(setting, value))
@@ -701,6 +862,7 @@ static ssize_t current_value_show(struct kobject *kobj,
 	} else if (ret == -EOPNOTSUPP) {
 		ret = coreboot_cfr_read_value(setting, &value, NULL);
 	}
+	coreboot_cfr_end_access(&access);
 	mutex_unlock(&setting->drvdata->lock);
 	unlock_system_sleep(sleep_flags);
 	if (ret)
