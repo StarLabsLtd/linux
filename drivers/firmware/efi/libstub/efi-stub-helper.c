@@ -435,7 +435,8 @@ efi_status_t efi_exit_boot_services(void *handle, void *priv,
 	if (efi_disable_pci_dma)
 		efi_pci_disable_bridge_busmaster();
 
-	status = efi_get_memory_map(&map, true);
+	/* x86 reserves the map via boot_params; keep it out of the E820 map. */
+	status = efi_get_memory_map(&map, !IS_ENABLED(CONFIG_X86));
 	if (status != EFI_SUCCESS)
 		return status;
 
