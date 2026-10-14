@@ -122,6 +122,8 @@ SNAPSHOT_S2RAM
 	to disk, and then the system is suspended to RAM (this makes it possible
 	to resume the system from RAM if there's enough battery power or restore
 	its state on the basis of the saved suspend image otherwise)
+	The sleep mode is selected by /sys/power/mem_sleep, as with built-in
+	hybrid hibernation.
 
 SNAPSHOT_ENABLE_ENCRYPTION
 	Enables encryption of the hibernate image within the kernel. Trusted

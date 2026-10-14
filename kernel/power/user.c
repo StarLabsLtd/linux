@@ -689,7 +689,7 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 		 * Tasks are frozen and the notifiers have been called with
 		 * PM_HIBERNATION_PREPARE
 		 */
-		error = suspend_devices_and_enter(PM_SUSPEND_MEM);
+		error = suspend_devices_and_enter(mem_sleep_current);
 		data->ready = false;
 		/* Keep workers frozen until opted-in output is retired. */
 		if (!error && snapshot_encryption_enabled(data) &&
