@@ -49,6 +49,8 @@ struct snapshot_data {
 	u64 crypt_swap_reserved;
 	loff_t swap_header_offset;
 	struct pid *owner_tgid;
+	/* Failed or restored encrypted sessions need SNAPSHOT_FREE to restart. */
+	bool crypt_failed;
 #endif
 
 };
@@ -79,6 +81,12 @@ loff_t snapshot_get_encrypted_image_size(struct snapshot_data *data,
 					 loff_t raw_size);
 
 int snapshot_finalize_decrypted_image(struct snapshot_data *data);
+void snapshot_encryption_capture_begin(void);
+
+static inline bool snapshot_encryption_failed(struct snapshot_data *data)
+{
+	return data->crypt_failed;
+}
 
 static inline bool snapshot_encryption_enabled(struct snapshot_data *data)
 {
@@ -134,6 +142,13 @@ static inline loff_t snapshot_get_encrypted_image_size(struct snapshot_data *dat
 static inline int snapshot_finalize_decrypted_image(struct snapshot_data *data)
 {
 	return -ENOTTY;
+}
+
+static inline void snapshot_encryption_capture_begin(void) {}
+
+static inline bool snapshot_encryption_failed(struct snapshot_data *data)
+{
+	return false;
 }
 
 static inline bool snapshot_encryption_enabled(struct snapshot_data *data)

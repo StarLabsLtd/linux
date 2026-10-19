@@ -2182,6 +2182,17 @@ unsigned long snapshot_get_meta_page_count(void)
 	return nr_meta_pages + 1;
 }
 
+int snapshot_get_image_size_for_restore(struct snapshot_handle *handle,
+					u64 *size)
+{
+	/* load_header() validates the header before the cursor advances past 1. */
+	if (handle->cur <= 1 || !nr_copy_pages)
+		return -ENODATA;
+
+	*size = ((u64)nr_meta_pages + nr_copy_pages + 1) << PAGE_SHIFT;
+	return 0;
+}
+
 static int init_header(struct swsusp_info *info)
 {
 	memset(info, 0, sizeof(struct swsusp_info));
@@ -2324,6 +2335,12 @@ static void mark_unsafe_pages(struct memory_bitmap *bm)
 static int check_header(struct swsusp_info *info)
 {
 	const char *reason;
+
+	if (!info->image_pages || info->pages <= info->image_pages ||
+	    info->pages - info->image_pages <= 1 ||
+	    info->pages > ULONG_MAX >> PAGE_SHIFT ||
+	    info->size != (info->pages << PAGE_SHIFT))
+		return -EINVAL;
 
 	reason = check_image_kernel(info);
 	if (!reason && info->num_physpages != get_num_physpages())

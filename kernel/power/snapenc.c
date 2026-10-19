@@ -278,6 +278,12 @@ static int snapshot_check_user_key_switch(struct snapshot_data *data)
 	return 0;
 }
 
+static int snapshot_fail_encryption(struct snapshot_data *data, int error)
+{
+	data->crypt_failed = true;
+	return error;
+}
+
 static loff_t snapshot_encrypted_byte_count(loff_t plain_size);
 
 static void snapshot_set_meta_size(struct snapshot_data *data, u64 meta_size)
@@ -371,6 +377,8 @@ static int snapshot_decrypt_drain(struct snapshot_data *data)
 	DECLARE_CRYPTO_WAIT(wait);
 	int page_count;
 	size_t total;
+	u64 expected_size;
+	bool expected_size_known;
 	int pg_idx;
 	int res;
 
@@ -427,14 +435,25 @@ static int snapshot_decrypt_drain(struct snapshot_data *data)
 
 	/* Push the decrypted pages further down the stack. */
 	total = 0;
+	res = snapshot_get_image_size_for_restore(&data->handle,
+						  &expected_size);
+	expected_size_known = !res;
+	if (res && res != -ENODATA)
+		return res;
+
 	for (pg_idx = 0; pg_idx < page_count; pg_idx++) {
 		void *buf = data->crypt_pages[pg_idx];
+
+		if (expected_size_known &&
+		    (data->crypt_total >= expected_size ||
+		     total >= expected_size - data->crypt_total))
+			return -EFBIG;
 
 		res = snapshot_write_next(&data->handle);
 		if (res < 0)
 			return res;
 		if (res == 0)
-			break;
+			return -ENODATA;
 
 		if (!data_of(data->handle))
 			return -EINVAL;
@@ -444,13 +463,19 @@ static int snapshot_decrypt_drain(struct snapshot_data *data)
 		/* Copy the decrypted page into the snapshot image. */
 		memcpy(data_of(data->handle), buf, PAGE_SIZE);
 		total += PAGE_SIZE;
+		res = snapshot_get_image_size_for_restore(&data->handle,
+							  &expected_size);
+		if (!res)
+			expected_size_known = true;
+		else if (res != -ENODATA)
+			return res;
 	}
 
 	if (data->crypt_total == 0) {
 		u64 meta_size = snapshot_get_meta_page_count() << PAGE_SHIFT;
 
 		data->meta_size = meta_size;
-		if (data->user_key_valid &&
+		if (data->crypt_meta_size &&
 		    data->crypt_meta_size != snapshot_encrypted_byte_count(meta_size))
 			return -EINVAL;
 	}
@@ -478,7 +503,7 @@ static ssize_t snapshot_read_next_encrypted(struct snapshot_data *data,
 		data->crypt_offset = 0;
 		rc = snapshot_encrypt_refill(data);
 		if (rc < 0)
-			return rc;
+			return snapshot_fail_encryption(data, rc);
 		if (!data->crypt_size)
 			return 0;
 	}
@@ -542,6 +567,8 @@ ssize_t snapshot_read_encrypted(struct snapshot_data *data,
 	void *src;
 	ssize_t src_size;
 
+	if (data->crypt_failed)
+		return -EPIPE;
 	if (!count)
 		return 0;
 
@@ -574,6 +601,8 @@ ssize_t snapshot_write_encrypted(struct snapshot_data *data,
 	ssize_t dst_size;
 	int rc;
 
+	if (data->crypt_failed)
+		return -EPIPE;
 	if (!count)
 		return 0;
 
@@ -602,7 +631,7 @@ ssize_t snapshot_write_encrypted(struct snapshot_data *data,
 	     data->crypt_stream_total == data->crypt_meta_size)) {
 		rc = snapshot_decrypt_drain(data);
 		if (rc < 0)
-			return rc;
+			return snapshot_fail_encryption(data, rc);
 	}
 
 	*offp += copy_size;
@@ -706,13 +735,19 @@ int snapshot_get_encryption_key(struct snapshot_data *data,
 	u8 nonce[USWSUSP_KEY_NONCE_SIZE];
 	int rc;
 
-	/* Don't pull a random key from a world that can be reset. */
-	if (data->ready)
+	if (data->crypt_failed || data->ready)
 		return -EPIPE;
+	if (data->aead_tfm)
+		return -EINVAL;
+	/* The ioctl holds system_transition_mutex and device_hotplug_lock. */
+	if (!rng_is_initialized())
+		return -EAGAIN;
 
 	rc = snapshot_setup_encryption_common(data);
-	if (rc)
+	if (rc) {
+		data->crypt_failed = true;
 		return rc;
+	}
 
 	/* Build a random starting nonce. */
 	get_random_bytes(nonce, sizeof(nonce));
@@ -754,7 +789,7 @@ fail:
 	memzero_explicit(image_key, sizeof(image_key));
 	memzero_explicit(&wrapped, sizeof(wrapped));
 	snapshot_teardown_encryption(data);
-	return rc;
+	return snapshot_fail_encryption(data, rc);
 }
 
 int snapshot_set_encryption_key(struct snapshot_data *data,
@@ -765,13 +800,20 @@ int snapshot_set_encryption_key(struct snapshot_data *data,
 	u8 image_key[SNAPSHOT_ENCRYPTION_KEY_SIZE] __nonstring = {};
 	int rc;
 
+	if (data->crypt_failed)
+		return -EPIPE;
+	if (data->aead_tfm)
+		return -EINVAL;
+
 	/* It's too late if data's been pushed in. */
 	if (data->handle.cur)
 		return -EPIPE;
 
 	rc = snapshot_setup_encryption_common(data);
-	if (rc)
+	if (rc) {
+		data->crypt_failed = true;
 		return rc;
+	}
 
 	/* Load the key from user mode. */
 	blob = memdup_user(key, sizeof(*blob));
@@ -811,7 +853,7 @@ crypto_setup_fail:
 	memzero_explicit(&wrapped, sizeof(wrapped));
 	memzero_explicit(image_key, sizeof(image_key));
 	snapshot_teardown_encryption(data);
-	return rc;
+	return snapshot_fail_encryption(data, rc);
 }
 
 static loff_t snapshot_encrypted_byte_count(loff_t plain_size)
@@ -840,9 +882,12 @@ int snapshot_set_user_key(struct snapshot_data *data,
 {
 	struct uswsusp_user_key user_key = {};
 	unsigned int key_len;
-	u64 size;
+	u64 meta_size = data->meta_size;
+	u64 crypt_meta_size;
 	int rc;
 
+	if (data->crypt_failed)
+		return -EPIPE;
 	if (!snapshot_encryption_enabled(data))
 		return -EINVAL;
 
@@ -869,31 +914,30 @@ int snapshot_set_user_key(struct snapshot_data *data,
 	 * Return the metadata size, the number of bytes that can be fed in before
 	 * the user data key is needed at resume time.
 	 */
-	if (data->mode == O_WRONLY && !data->meta_size) {
+	if (data->mode == O_WRONLY && !meta_size) {
 		if (user_key.meta_size < PAGE_SIZE + SNAPSHOT_AUTH_TAG_SIZE)
 			goto out;
 
-		data->crypt_meta_size = user_key.meta_size;
-		size = data->crypt_meta_size;
+		crypt_meta_size = user_key.meta_size;
 	} else {
-		snapshot_set_meta_size(data,
-				       snapshot_get_meta_page_count() << PAGE_SHIFT);
-		size = data->crypt_meta_size;
+		meta_size = snapshot_get_meta_page_count() << PAGE_SHIFT;
+		crypt_meta_size = snapshot_encrypted_byte_count(meta_size);
 	}
 
-	rc = put_user(size, &key->meta_size);
+	/* Don't allow it if it's too late. */
+	if ((meta_size && data->crypt_total > meta_size) ||
+	    data->crypt_stream_total > crypt_meta_size) {
+		rc = -EBUSY;
+		goto out;
+	}
+
+	rc = put_user(crypt_meta_size, &key->meta_size);
 	if (rc)
 		goto out;
 
 	key_len = user_key.key_len;
-
-	/* Don't allow it if it's too late. */
-	if ((data->meta_size && data->crypt_total > data->meta_size) ||
-	    (data->crypt_meta_size &&
-	     data->crypt_stream_total > data->crypt_meta_size)) {
-		rc = -EBUSY;
-		goto out;
-	}
+	data->meta_size = meta_size;
+	data->crypt_meta_size = crypt_meta_size;
 
 	/*
 	 * Resume may preload the user key before writing any image data, or
@@ -905,10 +949,12 @@ int snapshot_set_user_key(struct snapshot_data *data,
 	    data->crypt_stream_total == data->crypt_meta_size &&
 	    data->crypt_offset) {
 		rc = snapshot_decrypt_drain(data);
-		if (rc)
+		if (rc) {
+			rc = snapshot_fail_encryption(data, rc);
 			goto out;
+		}
 		if (data->crypt_total != data->meta_size) {
-			rc = -EINVAL;
+			rc = snapshot_fail_encryption(data, -EINVAL);
 			goto out;
 		}
 	}
@@ -918,8 +964,10 @@ int snapshot_set_user_key(struct snapshot_data *data,
 	data->user_key_valid = true;
 	/* Install the key if the user is just under the wire. */
 	rc = snapshot_check_user_key_switch(data);
-	if (rc)
+	if (rc) {
+		rc = snapshot_fail_encryption(data, rc);
 		goto out;
+	}
 
 	rc = 0;
 
@@ -944,13 +992,35 @@ loff_t snapshot_get_encrypted_image_size(struct snapshot_data *data,
 
 int snapshot_finalize_decrypted_image(struct snapshot_data *data)
 {
+	u64 expected_size;
 	int rc;
+
+	if (data->crypt_failed)
+		return -EPIPE;
 
 	if (data->crypt_offset != 0) {
 		rc = snapshot_decrypt_drain(data);
 		if (rc)
-			return rc;
+			goto fail;
+	}
+	rc = snapshot_get_image_size_for_restore(&data->handle,
+						 &expected_size);
+	if (rc)
+		goto fail;
+	if (data->crypt_total != expected_size) {
+		rc = -ENODATA;
+		goto fail;
+	}
+	rc = snapshot_write_finalize(&data->handle);
+	if (rc)
+		goto fail;
+	if (!snapshot_image_loaded(&data->handle)) {
+		rc = -ENODATA;
+		goto fail;
 	}
 
 	return 0;
+
+fail:
+	return snapshot_fail_encryption(data, rc);
 }
