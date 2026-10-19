@@ -129,10 +129,19 @@ SNAPSHOT_ENABLE_ENCRYPTION
 	unwrapped inside the kernel.
 
 	The first successful seed write establishes the wrapping key for that
-	boot. The kernel does not authenticate the writer, the TPM policy used to
-	unseal the seed, or image freshness. Early userspace must provision the
-	seed before untrusted privileged code can run and must enforce any TPM
-	policy and rollback protection.
+	boot. The kernel does not authenticate the writer or the TPM policy used
+	to unseal the seed. An older image encrypted with the same seed is still
+	valid if its authentication succeeds; this interface does not enforce
+	image freshness or prevent rollback.
+
+	Trusted early userspace must provision the seed before untrusted
+	privileged code can run. The deployment must also check freshness on
+	every authorized restore, including restores requested later by
+	privileged callers. Selecting a fresh image only during initial boot is
+	not sufficient. This interface provides no monotonic counter or other
+	freshness mechanism, so rollback protection remains a deployment
+	requirement. Without a trusted check on every restore, rollback
+	protection is unresolved.
 
 	Under lockdown, direct block-device write() calls to the selected swap
 	backend are restricted to the process which owns the snapshot device.
