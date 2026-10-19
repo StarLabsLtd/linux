@@ -3,11 +3,11 @@
  * coreboot CFR firmware attributes driver.
  *
  * Parses LB_TAG_CFR_ROOT records from the coreboot table and exposes
- * runtime EFI variable-backed options through the firmware-attributes class.
+ * runtime options through the firmware-attributes class.
  */
 
-#include <linux/acpi.h>
 #include <linux/array_size.h>
+#include <linux/acpi.h>
 #include <linux/bitops.h>
 #include <linux/cleanup.h>
 #include <linux/compiler_attributes.h>
@@ -19,6 +19,7 @@
 #include <linux/efi.h>
 #include <linux/err.h>
 #include <linux/firmware_attributes.h>
+#include <linux/io.h>
 #include <linux/kdev_t.h>
 #include <linux/kobject.h>
 #include <linux/kstrtox.h>
@@ -31,14 +32,19 @@
 #include <linux/suspend.h>
 #include <linux/sysfs.h>
 #include <linux/types.h>
+#include <linux/unaligned.h>
 
+#include "coreboot-cfr-private.h"
+#if IS_ENABLED(CONFIG_COREBOOT_CFR_KUNIT_TEST)
+#include "coreboot-cfr-kunit.h"
+#endif
 #include "coreboot_table.h"
 
 #define DRIVER_NAME "coreboot-cfr"
 
 #define LB_TAG_CFR_ROOT		0x47
+#define LB_TAG_CFR_SETTINGS	0x4b
 #define CFR_VERSION		0
-#define CFR_RUNTIME_APPLY_ACPI	2
 
 enum cfr_tags {
 	CFR_TAG_OPTION_FORM		= 1,
@@ -49,7 +55,11 @@ enum cfr_tags {
 	CFR_TAG_VARCHAR_OPT_NAME	= 7,
 	CFR_TAG_VARCHAR_UI_NAME		= 8,
 	CFR_TAG_VARCHAR_UI_HELPTEXT	= 9,
+	CFR_TAG_DEP_VALUES		= 12,
+	/* v13 EFI runtime apply metadata. */
 	CFR_TAG_RUNTIME_APPLY		= 13,
+	/* Atomic-service option token and permissions. */
+	CFR_TAG_OPTION_ACCESS		= 14,
 };
 
 enum cfr_option_flags {
@@ -59,6 +69,12 @@ enum cfr_option_flags {
 	CFR_OPTFLAG_VOLATILE	= BIT(3),
 	CFR_OPTFLAG_RUNTIME	= BIT(4),
 	CFR_OPTFLAG_LOCK_AT_BOOT	= BIT(5),
+};
+
+enum cfr_runtime_apply_method {
+	CFR_RUNTIME_APPLY_NONE		= 0,
+	CFR_RUNTIME_APPLY_APM_CNT	= 1,
+	CFR_RUNTIME_APPLY_ACPI		= 2,
 };
 
 struct lb_cfr {
@@ -87,6 +103,21 @@ struct lb_cfr_runtime_apply {
 	u32 id;
 } __packed;
 
+struct lb_cfr_option_access {
+	__le32 tag;
+	__le32 size;
+	__le32 version;
+	__le32 token;
+	__le32 permissions;
+	__le32 reserved;
+} __packed;
+
+#define CFR_OPTION_ACCESS_VERSION	1
+#define CFR_OPTION_ACCESS_READ		BIT(0)
+#define CFR_OPTION_ACCESS_WRITE		BIT(1)
+#define CFR_OPTION_ACCESS_PERMISSIONS_MASK \
+	(CFR_OPTION_ACCESS_READ | CFR_OPTION_ACCESS_WRITE)
+
 struct lb_cfr_numeric_option {
 	u32 tag;
 	u32 size;
@@ -108,21 +139,19 @@ struct lb_cfr_option_form {
 	u32 flags;
 } __packed;
 
-#define COREBOOT_CFR_OPT_SKIP_FLAGS \
-	(CFR_OPTFLAG_SUPPRESS | CFR_OPTFLAG_VOLATILE)
-
 #define COREBOOT_CFR_OPT_READ_ONLY_FLAGS \
-	(CFR_OPTFLAG_READONLY | CFR_OPTFLAG_INACTIVE | CFR_OPTFLAG_LOCK_AT_BOOT)
+	(CFR_OPTFLAG_READONLY | CFR_OPTFLAG_INACTIVE | CFR_OPTFLAG_VOLATILE | \
+	 CFR_OPTFLAG_LOCK_AT_BOOT)
 
 #define COREBOOT_CFR_EFI_ATTRS \
 	(EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS | \
 	 EFI_VARIABLE_RUNTIME_ACCESS)
 
+#define COREBOOT_CFR_APM_CNT_PORT	0xb2
+#define COREBOOT_CFR_APM_STS_PORT	0xb3
+#define COREBOOT_CFR_APM_APPLY_CMD	0xe3
 #define COREBOOT_CFR_MAX_FORM_DEPTH	16
-
-static efi_guid_t coreboot_cfr_guid = EFI_GUID(0xceae4c1d, 0x335b, 0x4685,
-					       0xa4, 0xa0, 0xfc, 0x4a,
-					       0x94, 0xee, 0xa0, 0x85);
+#define COREBOOT_CFR_MAX_DEPENDENCY_DEPTH	64
 
 enum coreboot_cfr_setting_type {
 	COREBOOT_CFR_SETTING_ENUM,
@@ -135,10 +164,19 @@ struct coreboot_cfr_enum {
 	u32 value;
 };
 
+struct coreboot_cfr_dependency {
+	struct list_head node;
+	u64 id;
+	u32 *values;
+	unsigned int n_values;
+	struct coreboot_cfr_setting *parent;
+};
+
 struct coreboot_cfr_setting {
 	struct kobject kobj;
 	struct list_head node;
 	struct coreboot_cfr_drvdata *drvdata;
+	u64 object_id;
 	enum coreboot_cfr_setting_type type;
 	char *name;
 	char *display_name;
@@ -150,19 +188,29 @@ struct coreboot_cfr_setting {
 	u32 min;
 	u32 max;
 	u32 step;
+	u32 runtime_apply_method;
 	u32 runtime_apply_id;
+	u32 access_token;
+	u32 access_permissions;
+	struct list_head dependencies;
+	u8 dependency_visit;
+	bool base_read_only;
 	bool read_only;
-	bool acpi_runtime;
+	bool expose;
+	bool needed;
+	bool available;
+	bool registered;
 };
 
 struct coreboot_cfr_drvdata {
 	struct device *class_dev;
 	struct kset *attrs_kset;
 	struct list_head settings;
-	/* Serializes setting access and pending_reboot. */
-	struct mutex lock;
+	const struct coreboot_cfr_backend_ops *backend;
 	acpi_handle acpi_handle;
-	bool efi_writes_supported;
+	/* Serializes writes and matching state refreshes. */
+	struct mutex lock;
+	bool faulted;
 	bool pending_reboot;
 };
 
@@ -179,7 +227,6 @@ static struct coreboot_cfr_setting *to_coreboot_cfr_setting(struct kobject *kobj
 static bool coreboot_cfr_string_is_valid_name(const char *name)
 {
 	return name && name[0] && !strchr(name, '/') &&
-		strcmp(name, ".") != 0 && strcmp(name, "..") != 0 &&
 		strcmp(name, "pending_reboot") != 0;
 }
 
@@ -191,33 +238,21 @@ static bool coreboot_cfr_string_is_valid_label(const char *label)
 static char *coreboot_cfr_string_dup(const struct lb_cfr_varbinary *str)
 {
 	const char *data = (const char *)(str + 1);
-	size_t len = str->data_length;
 
-	if (len && !data[len - 1])
-		len--;
-
-	return kmemdup_nul(data, len, GFP_KERNEL);
+	return kmemdup_nul(data, str->data_length - 1, GFP_KERNEL);
 }
 
-/* Optional display strings must fit completely, with newline and NUL. */
 static char *coreboot_cfr_display_string_dup(const struct lb_cfr_varbinary *str)
 {
 	const char *data = (const char *)(str + 1);
 	size_t len = str->data_length;
-	char *text;
 
 	if (len && !data[len - 1])
 		len--;
-	if (len > PAGE_SIZE - 2)
-		return ERR_PTR(-E2BIG);
-	if (memchr(data, '\0', len))
+	if (len > PAGE_SIZE - 2 || memchr(data, '\0', len))
 		return ERR_PTR(-EINVAL);
-	if (!len)
-		return NULL;
 
-	text = kmemdup_nul(data, len, GFP_KERNEL);
-
-	return text ?: ERR_PTR(-ENOMEM);
+	return len ? kmemdup_nul(data, len, GFP_KERNEL) : NULL;
 }
 
 static const struct coreboot_table_entry *
@@ -261,9 +296,9 @@ coreboot_cfr_child_entry(const void *base, size_t len, u32 tag)
 }
 
 static const struct lb_cfr_varbinary *
-coreboot_cfr_child_string(const void *base, size_t len, u32 tag)
+coreboot_cfr_child_varbinary(const void *base, size_t len, u32 tag)
 {
-	const struct lb_cfr_varbinary *str;
+	const struct lb_cfr_varbinary *value;
 	const struct coreboot_table_entry *entry;
 
 	entry = coreboot_cfr_child_entry(base, len, tag);
@@ -272,11 +307,27 @@ coreboot_cfr_child_string(const void *base, size_t len, u32 tag)
 	if (!entry)
 		return NULL;
 
-	if (entry->size < sizeof(*str))
+	if (entry->size < sizeof(*value))
 		return ERR_PTR(-EINVAL);
 
-	str = (const struct lb_cfr_varbinary *)entry;
-	if (str->data_length > entry->size - sizeof(*str))
+	value = (const struct lb_cfr_varbinary *)entry;
+	if (value->data_length > entry->size - sizeof(*value))
+		return ERR_PTR(-EINVAL);
+
+	return value;
+}
+
+static const struct lb_cfr_varbinary *
+coreboot_cfr_child_string(const void *base, size_t len, u32 tag)
+{
+	const struct lb_cfr_varbinary *str;
+
+	str = coreboot_cfr_child_varbinary(base, len, tag);
+	if (IS_ERR_OR_NULL(str))
+		return str;
+
+	if (!str->data_length || ((const u8 *)(str + 1))[str->data_length - 1] ||
+	    memchr(str + 1, '\0', str->data_length - 1))
 		return ERR_PTR(-EINVAL);
 
 	return str;
@@ -285,6 +336,7 @@ coreboot_cfr_child_string(const void *base, size_t len, u32 tag)
 static const struct lb_cfr_runtime_apply *
 coreboot_cfr_child_runtime_apply(const void *base, size_t len)
 {
+	const struct lb_cfr_runtime_apply *runtime_apply;
 	const struct coreboot_table_entry *entry;
 
 	entry = coreboot_cfr_child_entry(base, len, CFR_TAG_RUNTIME_APPLY);
@@ -292,11 +344,71 @@ coreboot_cfr_child_runtime_apply(const void *base, size_t len)
 		return ERR_CAST(entry);
 	if (!entry)
 		return NULL;
-	if (entry->size < sizeof(struct lb_cfr_runtime_apply))
+
+	if (entry->size != sizeof(*runtime_apply))
 		return ERR_PTR(-EINVAL);
 
-	return (const struct lb_cfr_runtime_apply *)entry;
+	runtime_apply = (const struct lb_cfr_runtime_apply *)entry;
+	if ((runtime_apply->method == CFR_RUNTIME_APPLY_APM_CNT &&
+	     runtime_apply->id > U8_MAX) ||
+	    (runtime_apply->method != CFR_RUNTIME_APPLY_APM_CNT &&
+	     runtime_apply->method != CFR_RUNTIME_APPLY_ACPI))
+		return ERR_PTR(-EINVAL);
+
+	return runtime_apply;
 }
+
+static const struct lb_cfr_option_access *
+coreboot_cfr_child_option_access(const void *base, size_t len)
+{
+	const struct lb_cfr_option_access *access;
+	const struct coreboot_table_entry *entry;
+
+	entry = coreboot_cfr_child_entry(base, len, CFR_TAG_OPTION_ACCESS);
+	if (IS_ERR(entry))
+		return ERR_CAST(entry);
+	if (!entry)
+		return NULL;
+
+	if (entry->size != sizeof(*access))
+		return ERR_PTR(-EINVAL);
+
+	access = (const struct lb_cfr_option_access *)entry;
+	if (get_unaligned_le32(&access->tag) != CFR_TAG_OPTION_ACCESS ||
+	    get_unaligned_le32(&access->size) != sizeof(*access) ||
+	    get_unaligned_le32(&access->version) != CFR_OPTION_ACCESS_VERSION ||
+	    !get_unaligned_le32(&access->token) ||
+	    !(get_unaligned_le32(&access->permissions) & CFR_OPTION_ACCESS_READ) ||
+	    get_unaligned_le32(&access->permissions) &
+	    ~CFR_OPTION_ACCESS_PERMISSIONS_MASK ||
+	    get_unaligned_le32(&access->reserved))
+		return ERR_PTR(-EINVAL);
+
+	return access;
+}
+
+static int coreboot_cfr_refresh_dependencies(struct coreboot_cfr_drvdata *data);
+
+static bool
+coreboot_cfr_setting_is_read_only(const struct coreboot_cfr_setting *setting)
+{
+	return setting->read_only || setting->drvdata->faulted;
+}
+
+u32 coreboot_cfr_setting_access_token(const struct coreboot_cfr_setting *setting)
+{
+	return setting->access_token;
+}
+
+bool coreboot_cfr_setting_access_writable(const struct coreboot_cfr_setting *setting)
+{
+	return setting->access_permissions & CFR_OPTION_ACCESS_WRITE;
+}
+
+#if IS_ENABLED(CONFIG_EFI)
+static efi_guid_t coreboot_cfr_guid = EFI_GUID(0xceae4c1d, 0x335b, 0x4685,
+					       0xa4, 0xa0, 0xfc, 0x4a,
+					       0x94, 0xee, 0xa0, 0x85);
 
 static efi_char16_t *coreboot_cfr_efi_name(const char *name)
 {
@@ -347,12 +459,14 @@ static int coreboot_cfr_read_efi_value(efi_char16_t *efi_name, u32 *value,
 	return 0;
 }
 
-static int coreboot_cfr_read_value(const struct coreboot_cfr_setting *setting,
-				   u32 *value, u32 *attrs)
+static int coreboot_cfr_efi_read(struct coreboot_cfr_setting *setting, u32 *value,
+				 struct coreboot_cfr_read_result *result)
 {
 	efi_char16_t *efi_name __free(kfree) =
 		coreboot_cfr_efi_name(setting->name);
 	int ret;
+
+	(void)result;
 
 	if (IS_ERR(efi_name))
 		return PTR_ERR(no_free_ptr(efi_name));
@@ -361,7 +475,7 @@ static int coreboot_cfr_read_value(const struct coreboot_cfr_setting *setting,
 	if (ret)
 		return ret;
 
-	ret = coreboot_cfr_read_efi_value(efi_name, value, attrs);
+	ret = coreboot_cfr_read_efi_value(efi_name, value, NULL);
 	efivar_unlock();
 
 	return ret;
@@ -388,6 +502,7 @@ static int coreboot_cfr_write_efi_value(efi_char16_t *efi_name, u32 value,
 
 static int coreboot_cfr_check_runtime(struct coreboot_cfr_setting *setting)
 {
+#if IS_ENABLED(CONFIG_ACPI)
 	union acpi_object param = {
 		.integer = { ACPI_TYPE_INTEGER, setting->runtime_apply_id },
 	};
@@ -411,19 +526,21 @@ static int coreboot_cfr_check_runtime(struct coreboot_cfr_setting *setting)
 			object = &object->package.elements[0];
 			if (object->type == ACPI_TYPE_LOCAL_REFERENCE &&
 			    object->reference.actual_type == ACPI_TYPE_DEVICE &&
-			    object->reference.handle) {
-				/* Native devices need exclusion before live access. */
+			    object->reference.handle)
 				ret = -EOPNOTSUPP;
-			}
 		}
 	}
 	ACPI_FREE(result.pointer);
 	return ret;
+#else
+	return -EOPNOTSUPP;
+#endif
 }
 
 static int coreboot_cfr_read_live_value(struct coreboot_cfr_setting *setting,
 					u32 *value)
 {
+#if IS_ENABLED(CONFIG_ACPI)
 	union acpi_object param = {
 		.integer = { ACPI_TYPE_INTEGER, setting->runtime_apply_id },
 	};
@@ -447,11 +564,15 @@ static int coreboot_cfr_read_live_value(struct coreboot_cfr_setting *setting,
 	}
 	ACPI_FREE(result.pointer);
 	return ret;
+#else
+	return -EOPNOTSUPP;
+#endif
 }
 
 static int coreboot_cfr_apply_runtime(struct coreboot_cfr_setting *setting,
 				      u32 value)
 {
+#if IS_ENABLED(CONFIG_ACPI)
 	union acpi_object params[] = {
 		{ .integer = { ACPI_TYPE_INTEGER, setting->runtime_apply_id } },
 		{ .integer = { ACPI_TYPE_INTEGER, value } },
@@ -470,38 +591,51 @@ static int coreboot_cfr_apply_runtime(struct coreboot_cfr_setting *setting,
 		ret = 0;
 	ACPI_FREE(result.pointer);
 	return ret;
+#else
+	return -EOPNOTSUPP;
+#endif
 }
 
-static int coreboot_cfr_write_value(struct coreboot_cfr_setting *setting,
-				    u32 value)
+static int coreboot_cfr_efi_apply_runtime(struct coreboot_cfr_setting *setting)
+{
+	u8 status;
+
+	if (setting->runtime_apply_method != CFR_RUNTIME_APPLY_APM_CNT)
+		return -EOPNOTSUPP;
+
+	outb((u8)setting->runtime_apply_id, COREBOOT_CFR_APM_STS_PORT);
+	outb(COREBOOT_CFR_APM_APPLY_CMD, COREBOOT_CFR_APM_CNT_PORT);
+	status = inb(COREBOOT_CFR_APM_STS_PORT);
+	if (status)
+		return -EIO;
+
+	return 0;
+}
+
+static int coreboot_cfr_efi_write(struct coreboot_cfr_setting *setting, u32 value,
+				  struct coreboot_cfr_write_result *result)
 {
 	efi_char16_t *efi_name;
-	unsigned int sleep_flags;
 	u32 attrs;
 	u32 old;
 	u32 live_value;
-	bool live;
-	bool notify;
+	bool live = false;
+	int restore_ret;
 	int ret;
-
-	if (setting->read_only)
-		return -EACCES;
 
 	efi_name = coreboot_cfr_efi_name(setting->name);
 	if (IS_ERR(efi_name))
 		return PTR_ERR(efi_name);
-
-	sleep_flags = lock_system_sleep();
-	mutex_lock(&setting->drvdata->lock);
-
-	ret = coreboot_cfr_check_runtime(setting);
-	if (ret && ret != -EOPNOTSUPP)
-		goto out_unlock_mutex;
-	live = !ret;
+	if (setting->acpi_runtime) {
+		ret = coreboot_cfr_check_runtime(setting);
+		if (ret && ret != -EOPNOTSUPP)
+			goto out_free_name;
+		live = !ret;
+	}
 
 	ret = efivar_lock();
 	if (ret)
-		goto out_unlock_mutex;
+		goto out_free_name;
 
 	ret = coreboot_cfr_read_efi_value(efi_name, &old, &attrs);
 	if (ret)
@@ -512,8 +646,10 @@ static int coreboot_cfr_write_value(struct coreboot_cfr_setting *setting,
 		goto out_unlock_efi;
 	}
 
-	if (old == value && !live)
+	if (old == value && !live) {
+		result->outcome = COREBOOT_CFR_ATOMIC_UNCHANGED;
 		goto out_unlock_efi;
+	}
 
 	ret = coreboot_cfr_write_efi_value(efi_name, value, attrs);
 	if (ret)
@@ -525,27 +661,145 @@ static int coreboot_cfr_write_value(struct coreboot_cfr_setting *setting,
 			ret = coreboot_cfr_read_live_value(setting, &live_value);
 		if (!ret && live_value != value)
 			ret = -EIO;
+		if (ret) {
+			setting->drvdata->pending_reboot = true;
+			result->outcome = COREBOOT_CFR_ATOMIC_REBOOT_REQUIRED;
+			goto out_unlock_efi;
+		}
+		result->outcome = COREBOOT_CFR_ATOMIC_APPLIED;
+		goto out_unlock_efi;
 	}
-	notify = false;
-	if (!live || ret) {
-		notify = !setting->drvdata->pending_reboot;
+
+	ret = coreboot_cfr_efi_apply_runtime(setting);
+	if (ret == -EOPNOTSUPP) {
+		/* EFI changed; firmware will consume it after reboot. */
 		setting->drvdata->pending_reboot = true;
+		result->outcome = COREBOOT_CFR_ATOMIC_REBOOT_REQUIRED;
+		ret = 0;
+	} else if (!ret) {
+		result->outcome = COREBOOT_CFR_ATOMIC_APPLIED;
+	} else if (ret) {
+		restore_ret = coreboot_cfr_write_efi_value(efi_name, old, attrs);
+		if (restore_ret) {
+			setting->drvdata->pending_reboot = true;
+			result->outcome = COREBOOT_CFR_ATOMIC_REBOOT_REQUIRED;
+			ret = restore_ret;
+		} else {
+			result->outcome = COREBOOT_CFR_ATOMIC_ROLLED_BACK;
+			result->status = ret;
+			goto out_unlock_efi;
+		}
 	}
 
 	efivar_unlock();
-	if (notify)
-		kobject_uevent(&setting->drvdata->class_dev->kobj, KOBJ_CHANGE);
-	mutex_unlock(&setting->drvdata->lock);
-	unlock_system_sleep(sleep_flags);
-	kfree(efi_name);
-	return ret;
+	goto out_free_name;
 
 out_unlock_efi:
 	efivar_unlock();
-out_unlock_mutex:
-	mutex_unlock(&setting->drvdata->lock);
-	unlock_system_sleep(sleep_flags);
+out_free_name:
 	kfree(efi_name);
+	return ret;
+}
+
+static bool coreboot_cfr_efi_writes_supported(struct coreboot_cfr_drvdata *data)
+{
+	(void)data;
+	return efivar_supports_writes();
+}
+
+static const struct coreboot_cfr_backend_ops coreboot_cfr_efi_backend = {
+	.read = coreboot_cfr_efi_read,
+	.write = coreboot_cfr_efi_write,
+	.writes_supported = coreboot_cfr_efi_writes_supported,
+};
+#endif
+
+static int coreboot_cfr_read_value(struct coreboot_cfr_setting *setting, u32 *value)
+{
+	struct coreboot_cfr_drvdata *data = setting->drvdata;
+	struct coreboot_cfr_read_result result = { };
+	int ret;
+
+	if (setting->acpi_runtime) {
+		ret = coreboot_cfr_check_runtime(setting);
+		if (!ret)
+			return coreboot_cfr_read_live_value(setting, value);
+		if (ret != -EOPNOTSUPP)
+			return ret;
+	}
+
+	ret = data->backend->read(setting, value, &result);
+	if (!result.faulted)
+		return ret;
+
+	data->faulted = true;
+	coreboot_cfr_refresh_dependencies(data);
+	return ret;
+}
+
+static int coreboot_cfr_write_value(struct coreboot_cfr_setting *setting, u32 value)
+{
+	struct coreboot_cfr_drvdata *data = setting->drvdata;
+	struct coreboot_cfr_write_result result = {
+		.outcome = COREBOOT_CFR_ATOMIC_REJECTED,
+	};
+	unsigned int sleep_flags = 0;
+	bool pending_reboot;
+	int transaction_ret = 0;
+	int ret;
+
+	if (setting->acpi_runtime)
+		sleep_flags = lock_system_sleep();
+	mutex_lock(&data->lock);
+	pending_reboot = data->pending_reboot;
+	if (coreboot_cfr_setting_is_read_only(setting)) {
+		ret = -EACCES;
+		goto out_unlock;
+	}
+
+	ret = data->backend->write(setting, value, &result);
+	if (ret) {
+		if (!pending_reboot && data->pending_reboot)
+			kobject_uevent(&data->class_dev->kobj, KOBJ_CHANGE);
+		goto out_unlock;
+	}
+
+	if (data->backend->atomic) {
+		switch (result.outcome) {
+		case COREBOOT_CFR_ATOMIC_UNCHANGED:
+		case COREBOOT_CFR_ATOMIC_APPLIED:
+			break;
+		case COREBOOT_CFR_ATOMIC_REBOOT_REQUIRED:
+			data->pending_reboot = true;
+			break;
+		case COREBOOT_CFR_ATOMIC_ROLLED_BACK:
+			transaction_ret = result.status ?: -EIO;
+			break;
+		case COREBOOT_CFR_ATOMIC_INDETERMINATE:
+			data->faulted = true;
+			coreboot_cfr_refresh_dependencies(data);
+			ret = result.status ?: -EIO;
+			goto out_unlock;
+		case COREBOOT_CFR_ATOMIC_REJECTED:
+		default:
+			ret = result.status ?: -EIO;
+			goto out_unlock;
+		}
+	}
+
+	ret = coreboot_cfr_refresh_dependencies(data);
+	if (!ret)
+		if (!data->backend->atomic ||
+		    result.outcome == COREBOOT_CFR_ATOMIC_APPLIED ||
+		    result.outcome == COREBOOT_CFR_ATOMIC_REBOOT_REQUIRED)
+			kobject_uevent(&data->class_dev->kobj, KOBJ_CHANGE);
+	if (!ret)
+		ret = transaction_ret;
+
+out_unlock:
+	mutex_unlock(&data->lock);
+	if (setting->acpi_runtime)
+		unlock_system_sleep(sleep_flags);
 	return ret;
 }
 
@@ -592,6 +846,9 @@ static bool coreboot_cfr_value_is_valid(struct coreboot_cfr_setting *setting,
 	if (value < setting->min || value > setting->max)
 		return false;
 
+	if (!setting->step)
+		return true;
+
 	delta = value - setting->min;
 	return delta % setting->step == 0;
 }
@@ -605,6 +862,13 @@ static ssize_t type_show(struct kobject *kobj, struct kobj_attribute *attr,
 		return sysfs_emit(buf, "integer\n");
 
 	return sysfs_emit(buf, "enumeration\n");
+}
+
+static ssize_t display_name_language_code_show(struct kobject *kobj,
+					       struct kobj_attribute *attr,
+					       char *buf)
+{
+	return sysfs_emit(buf, "en_US.UTF-8\n");
 }
 
 static ssize_t display_name_show(struct kobject *kobj,
@@ -681,6 +945,8 @@ static ssize_t default_value_show(struct kobject *kobj,
 		return sysfs_emit(buf, "%u\n", setting->default_value);
 
 	label = coreboot_cfr_label_from_value(setting, setting->default_value);
+	if (!label)
+		return sysfs_emit(buf, "%u\n", setting->default_value);
 
 	return sysfs_emit(buf, "%s\n", label);
 }
@@ -689,34 +955,35 @@ static ssize_t current_value_show(struct kobject *kobj,
 				  struct kobj_attribute *attr, char *buf)
 {
 	struct coreboot_cfr_setting *setting = to_coreboot_cfr_setting(kobj);
+	struct coreboot_cfr_drvdata *data = setting->drvdata;
 	const char *label;
-	unsigned int sleep_flags;
+	ssize_t len;
 	u32 value;
 	int ret;
 
-	sleep_flags = lock_system_sleep();
-	mutex_lock(&setting->drvdata->lock);
-	ret = coreboot_cfr_check_runtime(setting);
-	if (!ret) {
-		ret = coreboot_cfr_read_live_value(setting, &value);
-		if (!ret && !coreboot_cfr_value_is_valid(setting, value))
-			ret = -EINVAL;
-	} else if (ret == -EOPNOTSUPP) {
-		ret = coreboot_cfr_read_value(setting, &value, NULL);
+	mutex_lock(&data->lock);
+	ret = coreboot_cfr_read_value(setting, &value);
+	if (ret) {
+		len = ret;
+		goto out_unlock;
 	}
-	mutex_unlock(&setting->drvdata->lock);
-	unlock_system_sleep(sleep_flags);
-	if (ret)
-		return ret;
 
-	if (setting->type == COREBOOT_CFR_SETTING_NUMBER)
-		return sysfs_emit(buf, "%u\n", value);
+	if (setting->type == COREBOOT_CFR_SETTING_NUMBER) {
+		len = sysfs_emit(buf, "%u\n", value);
+		goto out_unlock;
+	}
 
 	label = coreboot_cfr_label_from_value(setting, value);
-	if (!label)
-		return -EINVAL;
+	if (!label) {
+		len = -EINVAL;
+		goto out_unlock;
+	}
 
-	return sysfs_emit(buf, "%s\n", label);
+	len = sysfs_emit(buf, "%s\n", label);
+
+out_unlock:
+	mutex_unlock(&data->lock);
+	return len;
 }
 
 static ssize_t current_value_store(struct kobject *kobj,
@@ -742,6 +1009,8 @@ static ssize_t current_value_store(struct kobject *kobj,
 }
 
 static struct kobj_attribute type_attr = __ATTR_RO(type);
+static struct kobj_attribute display_name_language_code_attr =
+	__ATTR_RO(display_name_language_code);
 static struct kobj_attribute display_name_attr = __ATTR_RO(display_name);
 static struct kobj_attribute help_text_attr = __ATTR_RO(help_text);
 static struct kobj_attribute display_group_attr = __ATTR_RO(display_group);
@@ -754,6 +1023,7 @@ static struct kobj_attribute current_value_attr = __ATTR_RW(current_value);
 
 static struct attribute *coreboot_cfr_setting_attrs[] = {
 	&type_attr.attr,
+	&display_name_language_code_attr.attr,
 	&display_name_attr.attr,
 	&help_text_attr.attr,
 	&display_group_attr.attr,
@@ -773,7 +1043,6 @@ static umode_t coreboot_cfr_attr_is_visible(struct kobject *kobj,
 
 	if (attr == &display_group_attr.attr && !setting->display_group)
 		return 0;
-
 	if (attr == &help_text_attr.attr && !setting->help_text)
 		return 0;
 
@@ -786,7 +1055,8 @@ static umode_t coreboot_cfr_attr_is_visible(struct kobject *kobj,
 	     attr == &scalar_increment_attr.attr))
 		return 0;
 
-	if (setting->read_only && attr == &current_value_attr.attr)
+	if (coreboot_cfr_setting_is_read_only(setting) &&
+	    attr == &current_value_attr.attr)
 		return 0444;
 
 	return attr->mode;
@@ -797,6 +1067,17 @@ static const struct attribute_group coreboot_cfr_setting_group = {
 	.is_visible = coreboot_cfr_attr_is_visible,
 };
 
+static void coreboot_cfr_free_dependencies(struct list_head *dependencies)
+{
+	struct coreboot_cfr_dependency *dependency, *tmp;
+
+	list_for_each_entry_safe(dependency, tmp, dependencies, node) {
+		list_del(&dependency->node);
+		kfree(dependency->values);
+		kfree(dependency);
+	}
+}
+
 static void coreboot_cfr_free_setting(struct coreboot_cfr_setting *setting)
 {
 	unsigned int i;
@@ -805,10 +1086,11 @@ static void coreboot_cfr_free_setting(struct coreboot_cfr_setting *setting)
 		kfree(setting->values[i].label);
 
 	kfree(setting->values);
-	kfree(setting->display_group);
-	kfree(setting->help_text);
 	kfree(setting->display_name);
+	kfree(setting->help_text);
+	kfree(setting->display_group);
 	kfree(setting->name);
+	coreboot_cfr_free_dependencies(&setting->dependencies);
 	kfree(setting);
 }
 
@@ -827,15 +1109,10 @@ static ssize_t pending_reboot_show(struct kobject *kobj,
 {
 	struct device *dev = kobj_to_dev(kobj->parent);
 	struct coreboot_cfr_drvdata *data;
-	bool pending_reboot;
 
 	data = dev_get_drvdata(dev);
 
-	mutex_lock(&data->lock);
-	pending_reboot = data->pending_reboot;
-	mutex_unlock(&data->lock);
-
-	return sysfs_emit(buf, "%d\n", pending_reboot);
+	return sysfs_emit(buf, "%d\n", READ_ONCE(data->pending_reboot));
 }
 
 static struct kobj_attribute pending_reboot_attr = __ATTR_RO(pending_reboot);
@@ -897,14 +1174,11 @@ static int coreboot_cfr_copy_enum_values(struct coreboot_cfr_setting *setting,
 	const struct lb_cfr_varbinary *label;
 	const struct coreboot_table_entry *entry;
 	struct coreboot_cfr_enum *value;
-	unsigned int i;
 	int count;
 
 	count = coreboot_cfr_count_enum_values(base, len);
-	if (count < 0)
-		return count;
-	if (!count)
-		return -EOPNOTSUPP;
+	if (count <= 0)
+		return count ?: -EINVAL;
 
 	setting->values = kcalloc(count, sizeof(*setting->values), GFP_KERNEL);
 	if (!setting->values)
@@ -936,15 +1210,14 @@ static int coreboot_cfr_copy_enum_values(struct coreboot_cfr_setting *setting,
 		value->label = coreboot_cfr_string_dup(label);
 		if (!value->label)
 			return -ENOMEM;
+		if (!coreboot_cfr_string_is_valid_label(value->label)) {
+			kfree(value->label);
+			value->label = NULL;
+			return -EINVAL;
+		}
+
 		value->value = enum_value->value;
 		setting->n_values++;
-		if (!coreboot_cfr_string_is_valid_label(value->label))
-			return -EOPNOTSUPP;
-		for (i = 0; i < setting->n_values - 1; i++) {
-			if (setting->values[i].value == value->value ||
-			    !strcmp(setting->values[i].label, value->label))
-				return -EOPNOTSUPP;
-		}
 	}
 }
 
@@ -977,12 +1250,302 @@ static int coreboot_cfr_setting_is_usable(struct coreboot_cfr_setting *setting)
 	u32 value;
 	int ret;
 
-	ret = coreboot_cfr_read_value(setting, &value, NULL);
+	if (!setting->name)
+		return -ENOENT;
+
+	ret = coreboot_cfr_read_value(setting, &value);
 	if (ret)
 		return ret;
 
 	if (!coreboot_cfr_value_is_valid(setting, value))
 		return -EINVAL;
+
+	return 0;
+}
+
+static int coreboot_cfr_add_dependency(struct coreboot_cfr_setting *setting,
+				       u64 id, const void *base, size_t len)
+{
+	const struct lb_cfr_varbinary *values;
+	struct coreboot_cfr_dependency *dependency;
+	const u8 *raw;
+	unsigned int i;
+
+	if (!id)
+		return 0;
+
+	values = coreboot_cfr_child_varbinary(base, len, CFR_TAG_DEP_VALUES);
+	if (IS_ERR(values))
+		return PTR_ERR(values);
+
+	dependency = kzalloc_obj(*dependency, GFP_KERNEL);
+	if (!dependency)
+		return -ENOMEM;
+
+	dependency->id = id;
+	if (values) {
+		if (!values->data_length || values->data_length % sizeof(u32)) {
+			kfree(dependency);
+			return -EINVAL;
+		}
+
+		dependency->n_values = values->data_length / sizeof(u32);
+		dependency->values = kmalloc_array(dependency->n_values,
+						   sizeof(*dependency->values), GFP_KERNEL);
+		if (!dependency->values) {
+			kfree(dependency);
+			return -ENOMEM;
+		}
+
+		raw = (const u8 *)(values + 1);
+		for (i = 0; i < dependency->n_values; i++)
+			dependency->values[i] = get_unaligned_le32(raw + i * sizeof(u32));
+	}
+
+	list_add_tail(&dependency->node, &setting->dependencies);
+	return 0;
+}
+
+static int coreboot_cfr_copy_dependencies(struct coreboot_cfr_setting *setting,
+					  const struct list_head *source)
+{
+	const struct coreboot_cfr_dependency *old;
+	struct coreboot_cfr_dependency *new;
+
+	list_for_each_entry(old, source, node) {
+		new = kmemdup(old, sizeof(*new), GFP_KERNEL);
+		if (!new)
+			return -ENOMEM;
+		new->values = kmemdup(old->values,
+				      array_size(old->n_values, sizeof(*new->values)),
+				      GFP_KERNEL);
+		if (old->n_values && !new->values) {
+			kfree(new);
+			return -ENOMEM;
+		}
+		new->parent = NULL;
+		list_add_tail(&new->node, &setting->dependencies);
+	}
+
+	return 0;
+}
+
+static struct coreboot_cfr_setting *
+coreboot_cfr_find_setting(struct coreboot_cfr_drvdata *data, u64 object_id)
+{
+	struct coreboot_cfr_setting *setting;
+
+	list_for_each_entry(setting, &data->settings, node) {
+		if (setting->object_id == object_id)
+			return setting;
+	}
+
+	return NULL;
+}
+
+static int coreboot_cfr_validate_dependency_visit(struct coreboot_cfr_setting *setting,
+						  unsigned int depth)
+{
+	struct coreboot_cfr_dependency *dependency;
+	int ret;
+
+	if (depth > COREBOOT_CFR_MAX_DEPENDENCY_DEPTH)
+		return -E2BIG;
+
+	if (setting->dependency_visit == 1)
+		return -ELOOP;
+	if (setting->dependency_visit == 2)
+		return 0;
+
+	setting->dependency_visit = 1;
+	list_for_each_entry(dependency, &setting->dependencies, node) {
+		ret = coreboot_cfr_validate_dependency_visit(dependency->parent,
+							     depth + 1);
+		if (ret)
+			return ret;
+	}
+	setting->dependency_visit = 2;
+
+	return 0;
+}
+
+static int coreboot_cfr_validate_dependencies(struct coreboot_cfr_drvdata *data)
+{
+	struct coreboot_cfr_setting *setting, *other;
+	struct coreboot_cfr_dependency *dependency;
+	unsigned int i;
+	int ret;
+
+	list_for_each_entry(setting, &data->settings, node) {
+		list_for_each_entry(other, &data->settings, node) {
+			if (setting->object_id && setting != other &&
+			    setting->object_id == other->object_id)
+				return -EINVAL;
+		}
+
+		list_for_each_entry(dependency, &setting->dependencies, node) {
+			dependency->parent = coreboot_cfr_find_setting(data, dependency->id);
+			if (!dependency->parent)
+				return -EINVAL;
+			for (i = 0; i < dependency->n_values; i++) {
+				if (!coreboot_cfr_value_is_valid(dependency->parent,
+								 dependency->values[i]))
+					return -EINVAL;
+			}
+		}
+	}
+
+	list_for_each_entry(setting, &data->settings, node) {
+		setting->dependency_visit = 0;
+		ret = coreboot_cfr_validate_dependency_visit(setting, 0);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static bool coreboot_cfr_skip_unusable_error(int ret)
+{
+	return ret == -ENOENT || ret == -EINVAL || ret == -EOPNOTSUPP ||
+	       ret == -ENAMETOOLONG;
+}
+
+static int coreboot_cfr_mark_setting_needed(struct coreboot_cfr_setting *setting,
+					    unsigned int depth)
+{
+	struct coreboot_cfr_dependency *dependency;
+	int ret;
+
+	if (depth > COREBOOT_CFR_MAX_DEPENDENCY_DEPTH)
+		return -E2BIG;
+
+	if (setting->needed)
+		return 0;
+
+	setting->needed = true;
+	list_for_each_entry(dependency, &setting->dependencies, node) {
+		ret = coreboot_cfr_mark_setting_needed(dependency->parent, depth + 1);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int coreboot_cfr_prepare_settings(struct coreboot_cfr_drvdata *data)
+{
+	struct coreboot_cfr_setting *setting, *tmp;
+	struct coreboot_cfr_dependency *dependency;
+	bool changed;
+	int ret;
+
+	list_for_each_entry(setting, &data->settings, node) {
+		setting->needed = false;
+		setting->available = true;
+	}
+
+	list_for_each_entry(setting, &data->settings, node) {
+		if (!setting->expose)
+			continue;
+
+		ret = coreboot_cfr_mark_setting_needed(setting, 0);
+		if (ret)
+			return ret;
+	}
+
+	list_for_each_entry(setting, &data->settings, node) {
+		if (!setting->needed) {
+			setting->available = false;
+			continue;
+		}
+
+		ret = coreboot_cfr_setting_is_usable(setting);
+		if (!ret)
+			continue;
+
+		if (!coreboot_cfr_skip_unusable_error(ret))
+			return ret;
+
+		setting->available = false;
+	}
+
+	do {
+		changed = false;
+		list_for_each_entry(setting, &data->settings, node) {
+			if (!setting->available)
+				continue;
+
+			list_for_each_entry(dependency, &setting->dependencies, node) {
+				if (dependency->parent->available)
+					continue;
+				setting->available = false;
+				changed = true;
+				break;
+			}
+		}
+	} while (changed);
+
+	list_for_each_entry_safe(setting, tmp, &data->settings, node) {
+		if (setting->available)
+			continue;
+
+		list_del(&setting->node);
+		coreboot_cfr_free_setting(setting);
+	}
+
+	return 0;
+}
+
+static int coreboot_cfr_refresh_dependencies(struct coreboot_cfr_drvdata *data)
+{
+	struct coreboot_cfr_setting *setting;
+	struct coreboot_cfr_dependency *dependency;
+	u32 value;
+	unsigned int i;
+	bool active;
+	int ret;
+
+	if (data->faulted) {
+		list_for_each_entry(setting, &data->settings, node) {
+			setting->read_only = true;
+			if (setting->registered) {
+				ret = sysfs_chmod_file(&setting->kobj,
+						       &current_value_attr.attr, 0444);
+				if (ret)
+					return ret;
+			}
+		}
+		return 0;
+	}
+
+	list_for_each_entry(setting, &data->settings, node) {
+		active = true;
+		list_for_each_entry(dependency, &setting->dependencies, node) {
+			ret = coreboot_cfr_read_value(dependency->parent, &value);
+			if (ret)
+				return ret;
+
+			if (!dependency->n_values) {
+				active &= value != 0;
+				continue;
+			}
+
+			for (i = 0; i < dependency->n_values; i++) {
+				if (value == dependency->values[i])
+					break;
+			}
+			active &= i != dependency->n_values;
+		}
+
+		setting->read_only = setting->base_read_only || !active;
+		if (setting->registered) {
+			ret = sysfs_chmod_file(&setting->kobj, &current_value_attr.attr,
+					       setting->read_only ? 0444 : 0644);
+			if (ret)
+				return ret;
+		}
+	}
 
 	return 0;
 }
@@ -1001,10 +1564,11 @@ static int coreboot_cfr_register_setting(struct coreboot_cfr_drvdata *data,
 	if (ret)
 		goto err_put_kobj;
 
-	list_add_tail(&setting->node, &data->settings);
+	setting->registered = true;
 	return 0;
 
 err_put_kobj:
+	list_del_init(&setting->node);
 	kobject_put(&setting->kobj);
 	return ret;
 }
@@ -1012,58 +1576,83 @@ err_put_kobj:
 static int coreboot_cfr_add_numeric_option(struct coreboot_cfr_drvdata *data,
 					   const struct lb_cfr_numeric_option *option,
 					   bool parent_read_only,
+					   bool parent_expose,
+					   const struct list_head *parent_dependencies,
 					   const char *display_group)
 {
 	const struct lb_cfr_varbinary *name;
 	const struct lb_cfr_varbinary *display_name;
 	const struct lb_cfr_varbinary *help_text;
 	const struct lb_cfr_runtime_apply *runtime_apply;
+	const struct lb_cfr_option_access *access = NULL;
 	const void *child_base = option + 1;
 	struct coreboot_cfr_setting *setting;
-	struct coreboot_cfr_setting *existing;
 	size_t child_len = option->size - sizeof(*option);
 	int ret;
-
-	if (!(option->flags & CFR_OPTFLAG_RUNTIME))
-		return 0;
-
-	if (option->flags & COREBOOT_CFR_OPT_SKIP_FLAGS)
-		return 0;
-
-	if (option->dependency_id)
-		return 0;
 
 	setting = kzalloc_obj(*setting, GFP_KERNEL);
 	if (!setting)
 		return -ENOMEM;
 
-	if (display_group) {
+	INIT_LIST_HEAD(&setting->node);
+	INIT_LIST_HEAD(&setting->dependencies);
+	setting->drvdata = data;
+	setting->object_id = option->object_id;
+	setting->default_value = option->default_value;
+	setting->min = option->min;
+	setting->max = option->max;
+	setting->step = option->step ?: 1;
+	setting->expose = parent_expose &&
+		(option->flags & CFR_OPTFLAG_RUNTIME) &&
+		!(option->flags & CFR_OPTFLAG_SUPPRESS);
+	if (setting->expose && display_group) {
 		setting->display_group = kstrdup(display_group, GFP_KERNEL);
 		if (!setting->display_group) {
 			ret = -ENOMEM;
 			goto err_put_setting;
 		}
 	}
+	ret = coreboot_cfr_copy_dependencies(setting, parent_dependencies);
+	if (ret)
+		goto err_put_setting;
 
-	INIT_LIST_HEAD(&setting->node);
-	setting->drvdata = data;
-	setting->default_value = option->default_value;
-	setting->min = option->min;
-	setting->max = option->max;
-	setting->step = option->step ?: 1;
-	setting->read_only =
-		(option->flags & COREBOOT_CFR_OPT_READ_ONLY_FLAGS) ||
-		!data->efi_writes_supported || parent_read_only;
-
-	runtime_apply = coreboot_cfr_child_runtime_apply(child_base, child_len);
-	if (IS_ERR(runtime_apply)) {
-		ret = PTR_ERR(runtime_apply);
+	access = coreboot_cfr_child_option_access(child_base, child_len);
+	if (IS_ERR(access)) {
+		ret = PTR_ERR(access);
 		goto err_put_setting;
 	}
-	if (runtime_apply && runtime_apply->method == CFR_RUNTIME_APPLY_ACPI) {
-		setting->acpi_runtime = true;
-		setting->runtime_apply_id = runtime_apply->id;
+	if (access) {
+		setting->access_token = get_unaligned_le32(&access->token);
+		setting->access_permissions =
+			get_unaligned_le32(&access->permissions);
 	}
+
+	if (!data->backend->atomic) {
+		runtime_apply = coreboot_cfr_child_runtime_apply(child_base, child_len);
+		if (IS_ERR(runtime_apply)) {
+			ret = PTR_ERR(runtime_apply);
+			goto err_put_setting;
+		}
+
+		if (runtime_apply) {
+			setting->runtime_apply_method = runtime_apply->method;
+			setting->runtime_apply_id = runtime_apply->id;
+			setting->acpi_runtime =
+				runtime_apply->method == CFR_RUNTIME_APPLY_ACPI;
+		}
+	}
+
+	setting->base_read_only =
+		(option->flags & COREBOOT_CFR_OPT_READ_ONLY_FLAGS) ||
+		!data->backend->writes_supported(data) || parent_read_only ||
+		(data->backend->atomic && !access) ||
+		(access && !coreboot_cfr_setting_access_writable(setting));
+	setting->read_only = setting->base_read_only;
+
+	ret = coreboot_cfr_add_dependency(setting, option->dependency_id,
+					  child_base, child_len);
+	if (ret)
+		goto err_put_setting;
 
 	name = coreboot_cfr_child_string(child_base, child_len,
 					 CFR_TAG_VARCHAR_OPT_NAME);
@@ -1071,59 +1660,53 @@ static int coreboot_cfr_add_numeric_option(struct coreboot_cfr_drvdata *data,
 		ret = PTR_ERR(name);
 		goto err_put_setting;
 	}
-	if (!name) {
+	if (!name && setting->expose) {
 		ret = -EINVAL;
 		goto err_put_setting;
 	}
 
-	setting->name = coreboot_cfr_string_dup(name);
-	if (!setting->name) {
-		ret = -ENOMEM;
-		goto err_put_setting;
-	}
+	if (name) {
+		setting->name = coreboot_cfr_string_dup(name);
+		if (!setting->name) {
+			ret = -ENOMEM;
+			goto err_put_setting;
+		}
 
-	if (!coreboot_cfr_string_is_valid_name(setting->name)) {
-		ret = 0;
-		goto err_put_setting;
-	}
-	list_for_each_entry(existing, &data->settings, node) {
-		if (!strcmp(existing->name, setting->name)) {
-			ret = 0;
+		if (!coreboot_cfr_string_is_valid_name(setting->name)) {
+			ret = -EINVAL;
 			goto err_put_setting;
 		}
 	}
 
-	display_name = coreboot_cfr_child_string(child_base, child_len,
-						 CFR_TAG_VARCHAR_UI_NAME);
-	if (IS_ERR(display_name)) {
-		ret = PTR_ERR(display_name);
-		goto err_put_setting;
-	}
-	if (display_name)
-		setting->display_name = coreboot_cfr_string_dup(display_name);
-	else
-		setting->display_name = kstrdup(setting->name, GFP_KERNEL);
-	if (!setting->display_name) {
-		ret = -ENOMEM;
-		goto err_put_setting;
-	}
-	if (strlen(setting->display_name) > PAGE_SIZE - 2) {
-		ret = 0;
-		goto err_put_setting;
-	}
-
-	help_text = coreboot_cfr_child_string(child_base, child_len,
-					      CFR_TAG_VARCHAR_UI_HELPTEXT);
-	if (IS_ERR(help_text)) {
-		ret = PTR_ERR(help_text);
-		goto err_put_setting;
-	}
-	if (help_text) {
-		setting->help_text = coreboot_cfr_display_string_dup(help_text);
-		if (IS_ERR(setting->help_text)) {
-			ret = PTR_ERR(setting->help_text);
-			setting->help_text = NULL;
+	if (setting->expose) {
+		display_name = coreboot_cfr_child_string(child_base, child_len,
+							 CFR_TAG_VARCHAR_UI_NAME);
+		if (IS_ERR(display_name)) {
+			ret = PTR_ERR(display_name);
 			goto err_put_setting;
+		}
+		if (display_name)
+			setting->display_name = coreboot_cfr_string_dup(display_name);
+		else
+			setting->display_name = kstrdup(setting->name, GFP_KERNEL);
+		if (!setting->display_name) {
+			ret = -ENOMEM;
+			goto err_put_setting;
+		}
+
+		help_text = coreboot_cfr_child_string(child_base, child_len,
+						      CFR_TAG_VARCHAR_UI_HELPTEXT);
+		if (IS_ERR(help_text)) {
+			ret = PTR_ERR(help_text);
+			goto err_put_setting;
+		}
+		if (help_text) {
+			setting->help_text = coreboot_cfr_display_string_dup(help_text);
+			if (IS_ERR(setting->help_text)) {
+				ret = PTR_ERR(setting->help_text);
+				setting->help_text = NULL;
+				goto err_put_setting;
+			}
 		}
 	}
 
@@ -1152,36 +1735,17 @@ static int coreboot_cfr_add_numeric_option(struct coreboot_cfr_drvdata *data,
 		break;
 	}
 
-	if (ret) {
-		if (ret == -EOPNOTSUPP)
-			ret = 0;
+	if (ret)
 		goto err_put_setting;
-	}
-	if (!coreboot_cfr_value_is_valid(setting, setting->default_value)) {
-		ret = 0;
-		goto err_put_setting;
-	}
 	/* possible_values must be returned completely in one sysfs read. */
-	if (setting->type != COREBOOT_CFR_SETTING_NUMBER &&
+	if (setting->expose && setting->type != COREBOOT_CFR_SETTING_NUMBER &&
 	    !coreboot_cfr_possible_values_fit(setting)) {
 		ret = 0;
 		goto err_put_setting;
 	}
 
-	ret = coreboot_cfr_setting_is_usable(setting);
-	if (ret) {
-		/*
-		 * CFR may describe options without a matching, readable runtime
-		 * EFI variable. Skip those, but propagate transient EFI failures.
-		 */
-		if (ret == -ENOENT || ret == -EINVAL || ret == -EOPNOTSUPP ||
-		    ret == -ENAMETOOLONG)
-			ret = 0;
-		goto err_put_setting;
-	}
-
-	/* The kobject release callback owns setting after this call. */
-	return coreboot_cfr_register_setting(data, setting);
+	list_add_tail(&setting->node, &data->settings);
+	return 0;
 
 err_put_setting:
 	coreboot_cfr_free_setting(setting);
@@ -1189,10 +1753,12 @@ err_put_setting:
 }
 
 static int coreboot_cfr_parse_records(struct coreboot_cfr_drvdata *data,
-				      const void *base, size_t len,
-				      unsigned int depth,
-				      bool parent_read_only,
-				      const char *display_group)
+					      const void *base, size_t len,
+					      unsigned int depth,
+					      bool parent_read_only,
+					      bool parent_expose,
+					      const struct list_head *parent_dependencies,
+					      const char *display_group)
 {
 	struct coreboot_cfr_iterator iterator = {
 		.cursor = base,
@@ -1213,20 +1779,17 @@ static int coreboot_cfr_parse_records(struct coreboot_cfr_drvdata *data,
 			return 0;
 
 		switch (entry->tag) {
-		case CFR_TAG_OPTION_FORM: {
+		case CFR_TAG_OPTION_FORM:
+		{
+			struct coreboot_cfr_setting context = { };
 			const struct lb_cfr_varbinary *title;
-
-			char *label __free(kfree) = NULL;
-			char *group __free(kfree) = NULL;
+			char *label = NULL;
+			char *group = NULL;
 
 			if (entry->size < sizeof(struct lb_cfr_option_form))
 				return -EINVAL;
 
 			form = (const struct lb_cfr_option_form *)entry;
-			if (form->dependency_id ||
-			    form->flags & CFR_OPTFLAG_SUPPRESS)
-				break;
-
 			if (depth >= COREBOOT_CFR_MAX_FORM_DEPTH)
 				return -E2BIG;
 
@@ -1239,25 +1802,42 @@ static int coreboot_cfr_parse_records(struct coreboot_cfr_drvdata *data,
 			if (title) {
 				label = coreboot_cfr_display_string_dup(title);
 				if (IS_ERR(label))
-					return PTR_ERR(no_free_ptr(label));
+					return PTR_ERR(label);
 			}
 			if (label) {
-				/* A display breadcrumb, not an escaped identifier path. */
-				if (display_group && strlen(display_group) +
-				    strlen(label) + 3 > PAGE_SIZE - 2)
-					return -E2BIG;
+				if (display_group && strlen(display_group) + strlen(label) + 3 >
+				    PAGE_SIZE - 2) {
+					ret = -E2BIG;
+					goto out_form;
+				}
 				group = display_group ?
 					kasprintf(GFP_KERNEL, "%s / %s", display_group, label) :
 					kstrdup(label, GFP_KERNEL);
-				if (!group)
-					return -ENOMEM;
+				if (!group) {
+					ret = -ENOMEM;
+					goto out_form;
+				}
 			}
-			ret = coreboot_cfr_parse_records(data, child_base,
-							 child_len, depth + 1,
-							 parent_read_only ||
-							 (form->flags &
-							  COREBOOT_CFR_OPT_READ_ONLY_FLAGS),
-							 group ?: display_group);
+
+			INIT_LIST_HEAD(&context.dependencies);
+			ret = coreboot_cfr_copy_dependencies(&context, parent_dependencies);
+			if (!ret)
+				ret = coreboot_cfr_add_dependency(
+					&context, form->dependency_id, child_base, child_len);
+			if (!ret)
+				ret = coreboot_cfr_parse_records(data, child_base,
+								 child_len, depth + 1,
+								 parent_read_only ||
+								 (form->flags &
+								  COREBOOT_CFR_OPT_READ_ONLY_FLAGS),
+								 parent_expose && !(form->flags &
+								 CFR_OPTFLAG_SUPPRESS),
+								 &context.dependencies,
+								 group ?: display_group);
+			coreboot_cfr_free_dependencies(&context.dependencies);
+		out_form:
+			kfree(group);
+			kfree(label);
 			if (ret)
 				return ret;
 			break;
@@ -1270,6 +1850,8 @@ static int coreboot_cfr_parse_records(struct coreboot_cfr_drvdata *data,
 				return -EINVAL;
 			ret = coreboot_cfr_add_numeric_option(data, option,
 							      parent_read_only,
+							      parent_expose,
+							      parent_dependencies,
 							      display_group);
 			if (ret)
 				return ret;
@@ -1281,21 +1863,57 @@ static int coreboot_cfr_parse_records(struct coreboot_cfr_drvdata *data,
 	}
 }
 
+static int coreboot_cfr_register_settings(struct coreboot_cfr_drvdata *data)
+{
+	struct coreboot_cfr_setting *setting;
+	bool registered = false;
+	int ret;
+
+	ret = coreboot_cfr_validate_dependencies(data);
+	if (ret)
+		return ret;
+
+	ret = coreboot_cfr_prepare_settings(data);
+	if (ret)
+		return ret;
+
+	ret = coreboot_cfr_refresh_dependencies(data);
+	if (ret)
+		return ret;
+
+	list_for_each_entry(setting, &data->settings, node) {
+		if (!setting->expose)
+			continue;
+
+		ret = coreboot_cfr_register_setting(data, setting);
+		if (ret)
+			return ret;
+		registered = true;
+	}
+
+	return registered ? 0 : -ENODEV;
+}
+
 static void coreboot_cfr_unregister_settings(struct coreboot_cfr_drvdata *data)
 {
 	struct coreboot_cfr_setting *setting, *tmp;
 
 	list_for_each_entry_safe(setting, tmp, &data->settings, node) {
-		sysfs_remove_group(&setting->kobj, &coreboot_cfr_setting_group);
 		list_del(&setting->node);
-		kobject_put(&setting->kobj);
+		if (setting->registered) {
+			sysfs_remove_group(&setting->kobj, &coreboot_cfr_setting_group);
+			kobject_put(&setting->kobj);
+		} else {
+			coreboot_cfr_free_setting(setting);
+		}
 	}
 }
 
-static int coreboot_cfr_probe(struct coreboot_device *dev)
+static int coreboot_cfr_root_probe(struct coreboot_device *dev)
 {
 	const struct lb_cfr *root = (const struct lb_cfr *)dev->raw;
 	struct coreboot_cfr_drvdata *data;
+	LIST_HEAD(root_dependencies);
 	size_t payload_len;
 	int ret;
 
@@ -1305,7 +1923,7 @@ static int coreboot_cfr_probe(struct coreboot_device *dev)
 	if (root->tag != LB_TAG_CFR_ROOT || root->version != CFR_VERSION)
 		return -EINVAL;
 
-	if (root->size < sizeof(*root))
+	if (root->size < sizeof(*root) || root->size > dev->entry.size)
 		return -EINVAL;
 
 	payload_len = root->size - sizeof(*root);
@@ -1316,7 +1934,12 @@ static int coreboot_cfr_probe(struct coreboot_device *dev)
 	if (!data)
 		return -ENOMEM;
 
-#ifdef CONFIG_ACPI
+	INIT_LIST_HEAD(&data->settings);
+	ret = devm_mutex_init(&dev->dev, &data->lock);
+	if (ret)
+		return ret;
+
+#if IS_ENABLED(CONFIG_ACPI)
 	data->acpi_handle = ACPI_HANDLE(dev->dev.parent);
 	if (data->acpi_handle &&
 	    (!acpi_has_method(data->acpi_handle, "CFRA") ||
@@ -1325,16 +1948,15 @@ static int coreboot_cfr_probe(struct coreboot_device *dev)
 		data->acpi_handle = NULL;
 #endif
 
-	ret = efivar_lock();
-	if (ret)
-		return ret == -ENODEV ? -EPROBE_DEFER : ret;
-	data->efi_writes_supported = efivar_supports_writes();
-	efivar_unlock();
-
-	INIT_LIST_HEAD(&data->settings);
-	ret = devm_mutex_init(&dev->dev, &data->lock);
-	if (ret)
-		return ret;
+	data->backend = coreboot_cfr_atomic_backend_get(dev);
+	if (IS_ERR(data->backend))
+		return PTR_ERR(data->backend);
+#if IS_ENABLED(CONFIG_EFI)
+	if (!data->backend && efivar_is_available())
+		data->backend = &coreboot_cfr_efi_backend;
+#endif
+	if (!data->backend)
+		return -ENODEV;
 
 	dev_set_drvdata(&dev->dev, data);
 
@@ -1356,7 +1978,8 @@ static int coreboot_cfr_probe(struct coreboot_device *dev)
 	if (ret)
 		goto err_unregister_attrs;
 
-	ret = coreboot_cfr_parse_records(data, root + 1, payload_len, 0, false, NULL);
+	ret = coreboot_cfr_parse_records(data, root + 1, payload_len, 0, false, true,
+					 &root_dependencies, NULL);
 	if (ret)
 		goto err_unregister_settings;
 
@@ -1364,6 +1987,10 @@ static int coreboot_cfr_probe(struct coreboot_device *dev)
 		ret = -ENODEV;
 		goto err_unregister_settings;
 	}
+
+	ret = coreboot_cfr_register_settings(data);
+	if (ret)
+		goto err_unregister_settings;
 
 	return 0;
 
@@ -1377,7 +2004,7 @@ err_unregister_dev:
 	return ret;
 }
 
-static void coreboot_cfr_remove(struct coreboot_device *dev)
+static void coreboot_cfr_root_remove(struct coreboot_device *dev)
 {
 	struct coreboot_cfr_drvdata *data = dev_get_drvdata(&dev->dev);
 
@@ -1389,9 +2016,208 @@ static void coreboot_cfr_remove(struct coreboot_device *dev)
 
 static const struct coreboot_device_id coreboot_cfr_ids[] = {
 	{ .tag = LB_TAG_CFR_ROOT },
+#if IS_ENABLED(CONFIG_X86)
+	{ .tag = LB_TAG_CFR_SETTINGS },
+#endif
 	{ }
 };
 MODULE_DEVICE_TABLE(coreboot, coreboot_cfr_ids);
+
+static int coreboot_cfr_probe(struct coreboot_device *dev)
+{
+	switch (dev->entry.tag) {
+	case LB_TAG_CFR_ROOT:
+		return coreboot_cfr_root_probe(dev);
+	case LB_TAG_CFR_SETTINGS:
+		return coreboot_cfr_atomic_service_probe(dev);
+	default:
+		return -ENODEV;
+	}
+}
+
+static void coreboot_cfr_remove(struct coreboot_device *dev)
+{
+	switch (dev->entry.tag) {
+	case LB_TAG_CFR_ROOT:
+		coreboot_cfr_root_remove(dev);
+		break;
+	case LB_TAG_CFR_SETTINGS:
+		coreboot_cfr_atomic_service_remove(dev);
+		break;
+	}
+}
+
+#if IS_ENABLED(CONFIG_COREBOOT_CFR_KUNIT_TEST)
+static int coreboot_cfr_kunit_read(struct coreboot_cfr_setting *setting, u32 *value,
+				   struct coreboot_cfr_read_result *result)
+{
+	(void)result;
+	*value = setting->default_value;
+	return 0;
+}
+
+static bool coreboot_cfr_kunit_writes_supported(struct coreboot_cfr_drvdata *data)
+{
+	(void)data;
+	return true;
+}
+
+static const struct coreboot_cfr_backend_ops coreboot_cfr_kunit_backend = {
+	.read = coreboot_cfr_kunit_read,
+	.writes_supported = coreboot_cfr_kunit_writes_supported,
+};
+
+static int
+coreboot_cfr_kunit_run(const struct coreboot_cfr_kunit_setting *settings,
+			unsigned int n_settings, bool prepare)
+{
+	struct coreboot_cfr_drvdata data = { };
+	struct coreboot_cfr_setting *setting;
+	struct coreboot_cfr_dependency *dependency;
+	unsigned int i, j, remaining = 0;
+	int ret;
+
+	if (!settings || !n_settings)
+		return -EINVAL;
+
+	INIT_LIST_HEAD(&data.settings);
+	data.backend = &coreboot_cfr_kunit_backend;
+	for (i = 0; i < n_settings; i++) {
+		setting = kzalloc_obj(*setting, GFP_KERNEL);
+		if (!setting) {
+			ret = -ENOMEM;
+			goto out_free_settings;
+		}
+
+		INIT_LIST_HEAD(&setting->node);
+		INIT_LIST_HEAD(&setting->dependencies);
+		setting->object_id = settings[i].object_id;
+		setting->drvdata = &data;
+		setting->type = COREBOOT_CFR_SETTING_NUMBER;
+		setting->min = settings[i].min;
+		setting->max = settings[i].max;
+		setting->step = settings[i].step ?: 1;
+		setting->default_value = setting->min;
+		setting->expose = settings[i].expose;
+		setting->name = kstrdup("kunit", GFP_KERNEL);
+		if (!setting->name) {
+			ret = -ENOMEM;
+			goto out_free_setting;
+		}
+
+		for (j = 0; j < settings[i].n_dependencies; j++) {
+			const struct coreboot_cfr_kunit_dependency *input =
+				&settings[i].dependencies[j];
+
+			if (input->n_values && !input->values) {
+				ret = -EINVAL;
+				goto out_free_setting;
+			}
+
+			dependency = kzalloc_obj(*dependency, GFP_KERNEL);
+			if (!dependency) {
+				ret = -ENOMEM;
+				goto out_free_setting;
+			}
+			dependency->id = input->id;
+			dependency->n_values = input->n_values;
+			dependency->values = kmemdup(input->values,
+					array_size(input->n_values,
+						   sizeof(*dependency->values)),
+					GFP_KERNEL);
+			if (input->n_values && !dependency->values) {
+				kfree(dependency);
+				ret = -ENOMEM;
+				goto out_free_setting;
+			}
+			list_add_tail(&dependency->node, &setting->dependencies);
+		}
+
+		list_add_tail(&setting->node, &data.settings);
+		continue;
+
+out_free_setting:
+		coreboot_cfr_free_setting(setting);
+		goto out_free_settings;
+	}
+
+	ret = coreboot_cfr_validate_dependencies(&data);
+	if (!ret && prepare) {
+		ret = coreboot_cfr_prepare_settings(&data);
+		if (!ret) {
+			list_for_each_entry(setting, &data.settings, node)
+				remaining++;
+			if (remaining != n_settings)
+				ret = -EUCLEAN;
+		}
+	}
+out_free_settings:
+	coreboot_cfr_unregister_settings(&data);
+	return ret;
+}
+
+int
+coreboot_cfr_kunit_validate_dependencies(const struct coreboot_cfr_kunit_setting *settings,
+					  unsigned int n_settings)
+{
+	return coreboot_cfr_kunit_run(settings, n_settings, false);
+}
+
+int
+coreboot_cfr_kunit_prepare_dependencies(const struct coreboot_cfr_kunit_setting *settings,
+					 unsigned int n_settings)
+{
+	return coreboot_cfr_kunit_run(settings, n_settings, true);
+}
+
+int coreboot_cfr_kunit_parse_dependency_values(const void *base, size_t len)
+{
+	struct coreboot_cfr_setting *setting;
+	int ret;
+
+	setting = kzalloc_obj(*setting, GFP_KERNEL);
+	if (!setting)
+		return -ENOMEM;
+
+	INIT_LIST_HEAD(&setting->dependencies);
+	ret = coreboot_cfr_add_dependency(setting, 1, base, len);
+	coreboot_cfr_free_setting(setting);
+	return ret;
+}
+
+int coreboot_cfr_kunit_parse_runtime_apply_and_access(const void *base, size_t len)
+{
+	const struct lb_cfr_runtime_apply *runtime_apply;
+	const struct lb_cfr_option_access *access;
+
+	runtime_apply = coreboot_cfr_child_runtime_apply(base, len);
+	if (IS_ERR(runtime_apply))
+		return PTR_ERR(runtime_apply);
+	access = coreboot_cfr_child_option_access(base, len);
+	if (IS_ERR(access))
+		return PTR_ERR(access);
+
+	return runtime_apply && access ? 0 : -EINVAL;
+}
+
+int coreboot_cfr_kunit_parse_string(const void *base, size_t len)
+{
+	const struct lb_cfr_varbinary *string;
+	char *copy;
+
+	string = coreboot_cfr_child_string(base, len, CFR_TAG_VARCHAR_OPT_NAME);
+	if (IS_ERR(string))
+		return PTR_ERR(string);
+	if (!string)
+		return -EINVAL;
+
+	copy = coreboot_cfr_string_dup(string);
+	if (!copy)
+		return -ENOMEM;
+	kfree(copy);
+	return 0;
+}
+#endif
 
 static struct coreboot_driver coreboot_cfr_driver = {
 	.probe = coreboot_cfr_probe,
@@ -1401,7 +2227,19 @@ static struct coreboot_driver coreboot_cfr_driver = {
 	},
 	.id_table = coreboot_cfr_ids,
 };
-module_coreboot_driver(coreboot_cfr_driver);
+
+static int __init coreboot_cfr_init(void)
+{
+	return coreboot_driver_register(&coreboot_cfr_driver);
+}
+
+static void __exit coreboot_cfr_exit(void)
+{
+	coreboot_driver_unregister(&coreboot_cfr_driver);
+}
+
+module_init(coreboot_cfr_init);
+module_exit(coreboot_cfr_exit);
 
 MODULE_AUTHOR("Sean Rhodes <sean@starlabs.systems>");
 MODULE_DESCRIPTION("coreboot CFR firmware attributes driver");
