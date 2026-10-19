@@ -51,18 +51,31 @@ config COREBOOT_TABLE
 
 config COREBOOT_CFR
 	tristate "coreboot CFR firmware attributes"
-	depends on EFI
 	depends on COREBOOT_TABLE
 	depends on HAS_IOPORT
 	select CRC32
 	select FW_ATTR_CLASS
 	help
-	  This driver parses the coreboot CFR table and exposes runtime EFI
-	  variable-backed options through the firmware-attributes sysfs
-	  interface.
+	  This driver parses the coreboot CFR table and exposes runtime options
+	  through the firmware-attributes sysfs interface.  It prefers coreboot's
+	  atomic settings service when firmware publishes it and otherwise uses EFI
+	  runtime variables.  The EFI fallback serializes kernel writers but cannot
+	  provide the firmware-owned compare-and-set semantics of the atomic service.
+	  It does not register a synthetic EFI runtime provider.
 
 	  If you have a system running coreboot with CFR runtime
 	  configuration support, say Y or M here.
+
+config COREBOOT_CFR_KUNIT_TEST
+	bool "coreboot CFR dependency graph KUnit tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT && COREBOOT_CFR=y
+	default KUNIT_ALL_TESTS
+	help
+	  Run focused tests for the CFR dependency graph validation paths.
+	  The tests cover duplicate object IDs, missing dependency IDs, cycles,
+	  dependency values outside the controlling option's accepted range, and
+	  malformed string records.
+	  They are intended for development and should not be enabled in production.
 
 config COREBOOT_MEMCONSOLE_COMMON
 	tristate
