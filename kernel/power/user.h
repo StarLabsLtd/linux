@@ -5,7 +5,6 @@
 
 #include <linux/crypto.h>
 #include <linux/scatterlist.h>
-#include <linux/spinlock.h>
 #include <linux/suspend_ioctls.h>
 #include <crypto/aead.h>
 #include <crypto/aes.h>
@@ -46,11 +45,8 @@ struct snapshot_data {
 	bool user_key_valid;
 	u64 meta_size;
 	u64 crypt_meta_size;
-	/* Protect the swap allocation and block-write reservations. */
-	spinlock_t crypt_lock;
 	u64 crypt_swap_allocated;
 	u64 crypt_swap_reserved;
-	u64 crypt_header_reserved;
 	loff_t swap_header_offset;
 	struct pid *owner_tgid;
 #endif

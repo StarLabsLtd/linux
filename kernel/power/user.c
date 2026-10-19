@@ -43,19 +43,26 @@ bool hibernate_snapshot_write_active(dev_t dev)
 #if defined(CONFIG_ENCRYPTED_HIBERNATION)
 	struct snapshot_data *data = &snapshot_state;
 
+	/* Keep the selected backend protected until the session releases it. */
 	return data->encryption_required && data->mode == O_RDONLY &&
-		data->ready && data->dev == dev &&
-		snapshot_encryption_enabled(data);
+		data->dev == dev && data->swap >= 0 &&
+		data->swap < MAX_SWAPFILES && data->owner_tgid;
 #else
 	return false;
 #endif
 }
 
 #if defined(CONFIG_ENCRYPTED_HIBERNATION)
-static bool snapshot_encrypted_output_owned(struct snapshot_data *data, dev_t dev)
+static bool snapshot_output_session_owned(struct snapshot_data *data, dev_t dev)
 {
 	return hibernate_snapshot_write_active(dev) &&
 		data->owner_tgid == task_tgid(current);
+}
+
+static bool snapshot_encrypted_output_owned(struct snapshot_data *data, dev_t dev)
+{
+	return snapshot_output_session_owned(data, dev) && data->ready &&
+		snapshot_encryption_enabled(data);
 }
 
 static bool snapshot_header_write_range(struct snapshot_data *data,
@@ -82,12 +89,9 @@ static u64 snapshot_swap_write_budget(struct snapshot_data *data)
 static void snapshot_reset_swap_write_state(struct snapshot_data *data,
 					    bool reset_allocation)
 {
-	spin_lock(&data->crypt_lock);
 	if (reset_allocation)
 		data->crypt_swap_allocated = 0;
 	data->crypt_swap_reserved = 0;
-	data->crypt_header_reserved = 0;
-	spin_unlock(&data->crypt_lock);
 }
 #endif
 
@@ -100,30 +104,27 @@ hibernate_snapshot_write_begin(dev_t dev, loff_t pos, size_t count)
 	bool image_range_allocated;
 	u64 swap_budget;
 
-	if (!count || !snapshot_encrypted_output_owned(data, dev))
+	if (!count || !hibernate_snapshot_write_active(dev))
 		return HIBERNATE_SNAPSHOT_WRITE_NONE;
 
 	mutex_lock(&system_transition_mutex);
 
-	if (!snapshot_encrypted_output_owned(data, dev))
+	if (!snapshot_output_session_owned(data, dev))
 		goto unlock;
 
-	image_range_allocated = swsusp_swap_range_allocated(data->swap, pos, count);
-
-	spin_lock(&data->crypt_lock);
-	swap_budget = snapshot_swap_write_budget(data);
-	if (snapshot_header_write_range(data, pos, count) &&
-	    data->crypt_header_reserved <= PAGE_SIZE &&
-	    PAGE_SIZE - data->crypt_header_reserved >= count) {
-		data->crypt_header_reserved += count;
+	if (snapshot_header_write_range(data, pos, count)) {
 		type = HIBERNATE_SNAPSHOT_WRITE_HEADER;
-	} else if (image_range_allocated &&
-		   swap_budget >= data->crypt_swap_reserved &&
-		   swap_budget - data->crypt_swap_reserved >= count) {
-		data->crypt_swap_reserved += count;
-		type = HIBERNATE_SNAPSHOT_WRITE_IMAGE;
+	} else if (snapshot_encrypted_output_owned(data, dev)) {
+		image_range_allocated =
+			swsusp_swap_range_allocated(data->swap, pos, count);
+		swap_budget = snapshot_swap_write_budget(data);
+		if (image_range_allocated &&
+		    swap_budget >= data->crypt_swap_reserved &&
+		    swap_budget - data->crypt_swap_reserved >= count) {
+			data->crypt_swap_reserved += count;
+			type = HIBERNATE_SNAPSHOT_WRITE_IMAGE;
+		}
 	}
-	spin_unlock(&data->crypt_lock);
 
 	if (type == HIBERNATE_SNAPSHOT_WRITE_NONE)
 		goto unlock;
@@ -148,24 +149,20 @@ void hibernate_snapshot_write_end(enum hibernate_snapshot_write type,
 
 	if (type == HIBERNATE_SNAPSHOT_WRITE_NONE)
 		return;
+	if (type == HIBERNATE_SNAPSHOT_WRITE_HEADER)
+		goto unlock;
 	if (!reserved)
 		goto unlock;
 
-	if (type == HIBERNATE_SNAPSHOT_WRITE_HEADER)
-		unused = reserved;
-	else if (written <= 0)
+	if (written <= 0)
 		unused = reserved;
 	else if (written < reserved)
 		unused = reserved - written;
 	else
 		goto unlock;
 
-	reserved_total = type == HIBERNATE_SNAPSHOT_WRITE_HEADER ?
-		&data->crypt_header_reserved : &data->crypt_swap_reserved;
-
-	spin_lock(&data->crypt_lock);
+	reserved_total = &data->crypt_swap_reserved;
 	*reserved_total -= min_t(u64, *reserved_total, unused);
-	spin_unlock(&data->crypt_lock);
 
 unlock:
 	mutex_unlock(&system_transition_mutex);
@@ -204,10 +201,8 @@ static int snapshot_open(struct inode *inode, struct file *filp)
 	filp->private_data = data;
 	memset(&data->handle, 0, sizeof(struct snapshot_handle));
 #if defined(CONFIG_ENCRYPTED_HIBERNATION)
-	spin_lock_init(&data->crypt_lock);
 	data->crypt_swap_allocated = 0;
 	data->crypt_swap_reserved = 0;
-	data->crypt_header_reserved = 0;
 	data->swap_header_offset = 0;
 	data->owner_tgid = NULL;
 #endif
@@ -234,6 +229,7 @@ static int snapshot_open(struct inode *inode, struct file *filp)
 	}
 	if (error) {
 		unpin_hibernation_swap_type(data->swap);
+		data->swap = -1;
 		hibernate_release();
 	}
 
@@ -266,9 +262,11 @@ static int snapshot_release(struct inode *inode, struct file *filp)
 #if defined(CONFIG_ENCRYPTED_HIBERNATION)
 	put_pid(data->owner_tgid);
 	data->owner_tgid = NULL;
+	data->swap_header_offset = 0;
 #endif
 	free_all_swap_pages(data->swap);
 	unpin_hibernation_swap_type(data->swap);
+	data->swap = -1;
 	if (data->frozen) {
 		pm_restore_gfp_mask();
 		free_basic_memory_bitmaps();
@@ -417,6 +415,12 @@ static int snapshot_set_swap_area(struct snapshot_data *data,
 	 * set by SNAPSHOT_SET_SWAP_AREA.
 	 */
 	unpin_hibernation_swap_type(data->swap);
+	data->swap = -1;
+	data->dev = 0;
+#if defined(CONFIG_ENCRYPTED_HIBERNATION)
+	data->swap_header_offset = 0;
+	snapshot_reset_swap_write_state(data, true);
+#endif
 
 	/*
 	 * User space encodes device types as two-byte values,
@@ -587,9 +591,7 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 			error = put_user(offset, (loff_t __user *)arg);
 #if defined(CONFIG_ENCRYPTED_HIBERNATION)
 			if (!error) {
-				spin_lock(&data->crypt_lock);
 				data->crypt_swap_allocated++;
-				spin_unlock(&data->crypt_lock);
 			}
 #endif
 		} else {

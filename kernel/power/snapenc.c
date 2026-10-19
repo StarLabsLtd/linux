@@ -48,8 +48,10 @@ int snapshot_store_encryption_seed(const char *buf, size_t count)
 		return -EINVAL;
 
 	ret = hex2bin(seed, buf, sizeof(seed));
-	if (ret)
+	if (ret) {
+		memzero_explicit(seed, sizeof(seed));
 		return ret;
+	}
 
 	mutex_lock(&snapshot_seed_mutex);
 	if (snapshot_seed_valid) {
@@ -106,7 +108,9 @@ static int snapshot_crypt_wrapped_key(struct snapshot_wrapped_key *wrapped,
 				      bool encrypt)
 {
 	u8 wrap_key[SNAPSHOT_ENCRYPTION_KEY_SIZE] __nonstring;
-	u8 buf[SNAPSHOT_ENCRYPTION_KEY_SIZE + SNAPSHOT_AUTH_TAG_SIZE] __nonstring;
+	const size_t buf_len = SNAPSHOT_ENCRYPTION_KEY_SIZE +
+		SNAPSHOT_AUTH_TAG_SIZE;
+	u8 *buf;
 	struct crypto_aead *tfm;
 	struct aead_request *req;
 	struct scatterlist sg;
@@ -117,10 +121,16 @@ static int snapshot_crypt_wrapped_key(struct snapshot_wrapped_key *wrapped,
 	if (rc)
 		return rc;
 
+	buf = kmalloc(buf_len, GFP_KERNEL);
+	if (!buf) {
+		rc = -ENOMEM;
+		goto out_key;
+	}
+
 	tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
 	if (IS_ERR(tfm)) {
 		rc = PTR_ERR(tfm);
-		goto out_key;
+		goto out_buf;
 	}
 
 	rc = crypto_aead_setkey(tfm, wrap_key, sizeof(wrap_key));
@@ -146,12 +156,12 @@ static int snapshot_crypt_wrapped_key(struct snapshot_wrapped_key *wrapped,
 		       SNAPSHOT_AUTH_TAG_SIZE);
 	}
 
-	sg_init_one(&sg, buf, sizeof(buf));
+	sg_init_one(&sg, buf, buf_len);
 	aead_request_set_callback(req, 0, crypto_req_done, &wait);
 	aead_request_set_ad(req, 0);
 	aead_request_set_crypt(req, &sg, &sg,
 			       encrypt ? SNAPSHOT_ENCRYPTION_KEY_SIZE :
-					 sizeof(buf),
+					 buf_len,
 			       wrapped->wrap_nonce);
 
 	rc = crypto_wait_req(encrypt ? crypto_aead_encrypt(req) :
@@ -172,8 +182,9 @@ out_req:
 	aead_request_free(req);
 out_tfm:
 	crypto_free_aead(tfm);
+out_buf:
+	kfree_sensitive(buf);
 out_key:
-	memzero_explicit(buf, sizeof(buf));
 	memzero_explicit(wrap_key, sizeof(wrap_key));
 	return rc;
 }
@@ -835,8 +846,10 @@ int snapshot_set_user_key(struct snapshot_data *data,
 	if (!snapshot_encryption_enabled(data))
 		return -EINVAL;
 
-	if (copy_from_user(&user_key, key, sizeof(struct uswsusp_user_key)))
-		return -EFAULT;
+	if (copy_from_user(&user_key, key, sizeof(struct uswsusp_user_key))) {
+		rc = -EFAULT;
+		goto out;
+	}
 
 	BUILD_BUG_ON(sizeof(data->user_key) < sizeof(user_key.key));
 	rc = -EINVAL;
@@ -919,23 +932,14 @@ loff_t snapshot_get_encrypted_image_size(struct snapshot_data *data,
 					 loff_t raw_size)
 {
 	loff_t meta_plain_size = data->meta_size;
-	loff_t split_size;
+
+	if (!data->user_key_valid)
+		return snapshot_encrypted_byte_count(raw_size);
 
 	if (!meta_plain_size)
 		meta_plain_size = snapshot_get_meta_page_count() << PAGE_SHIFT;
 
-	split_size = snapshot_encrypted_split_byte_count(raw_size,
-							 meta_plain_size);
-	if (!data->user_key_valid) {
-		/*
-		 * Userspace may install a user key after querying the image size.
-		 * Reserve enough space for either framing so that later splitting at
-		 * the metadata boundary cannot make the reported size too small.
-		 */
-		return max(snapshot_encrypted_byte_count(raw_size), split_size);
-	}
-
-	return split_size;
+	return snapshot_encrypted_split_byte_count(raw_size, meta_plain_size);
 }
 
 int snapshot_finalize_decrypted_image(struct snapshot_data *data)
