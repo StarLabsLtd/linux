@@ -70,7 +70,9 @@ SNAPSHOT_PREF_IMAGE_SIZE
 SNAPSHOT_GET_IMAGE_SIZE
 	return the actual size of the hibernation image
 	(the last argument should be a pointer to a loff_t variable that
-	will contain the result if the call is successful)
+	will contain the result if the call is successful).  When using an
+	optional user key, install it before the final size query, or query
+	the size again after successfully changing the key configuration.
 
 SNAPSHOT_AVAIL_SWAP_SIZE
 	return the amount of available swap in bytes
@@ -114,6 +116,52 @@ SNAPSHOT_S2RAM
 	to disk, and then the system is suspended to RAM (this makes it possible
 	to resume the system from RAM if there's enough battery power or restore
 	its state on the basis of the saved suspend image otherwise)
+
+SNAPSHOT_ENABLE_ENCRYPTION
+	Enables encryption of the hibernate image within the kernel. Trusted
+	early userspace must write the 32-byte snapshot encryption seed to
+	/sys/power/snapshot_seed before calling this ioctl. Upon suspend
+	(ie when the snapshot device was opened for reading), this ioctl returns
+	an opaque wrapped key blob and the starting nonce. Upon resume (ie when
+	the snapshot device was opened for writing), this ioctl receives the
+	same blob and nonce from usermode after the same seed has been written
+	to /sys/power/snapshot_seed. The plaintext image key is generated and
+	unwrapped inside the kernel.
+
+	The first successful seed write establishes the wrapping key for that
+	boot. The kernel does not authenticate the writer or the TPM policy used
+	to unseal the seed. An older image encrypted with the same seed is still
+	valid if its authentication succeeds; this interface does not enforce
+	image freshness or prevent rollback.
+
+	Trusted early userspace must provision the seed before untrusted
+	privileged code can run. The deployment must also check freshness on
+	every authorized restore, including restores requested later by
+	privileged callers. Selecting a fresh image only during initial boot is
+	not sufficient. This interface provides no monotonic counter or other
+	freshness mechanism, so rollback protection remains a deployment
+	requirement. Without a trusted check on every restore, rollback
+	protection is unresolved.
+
+	Under lockdown, direct block-device write() calls to the selected swap
+	backend are restricted to the process which owns the snapshot device.
+	Image writes additionally require an active encrypted image and extents
+	allocated with SNAPSHOT_ALLOC_SWAP_PAGE; they cannot exceed the number
+	of pages returned by that ioctl. Header cleanup is limited to the one
+	page at the offset supplied with SNAPSHOT_SET_SWAP_AREA and remains
+	available to the owning session after SNAPSHOT_S2RAM or SNAPSHOT_FREE.
+	Both kinds of writes must use synchronous buffered I/O (O_DSYNC without
+	O_DIRECT). The header-cleanup exception ends when the session releases
+	the selected swap backend.
+
+SNAPSHOT_SET_USER_KEY
+	Mixes additional user key material into the data portion of an encrypted
+	hibernate image. The ioctl argument points to struct uswsusp_user_key.
+	key_len must be between 8 and USWSUSP_USER_KEY_SIZE bytes, and reserved
+	must be zero. During hibernation the kernel writes meta_size with the
+	encrypted metadata size. During resume, userspace passes the saved
+	meta_size back so the kernel can switch keys at the metadata boundary
+	before the snapshot header has been decrypted.
 
 The device's read() operation can be used to transfer the snapshot image from
 the kernel.  It has the following limitations:

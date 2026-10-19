@@ -36,6 +36,7 @@
 #include <trace/events/power.h>
 
 #include "power.h"
+#include "user.h"
 
 
 static int nocompress;
@@ -110,6 +111,14 @@ bool hibernation_available(void)
 {
 	return nohibernate == 0 &&
 		!security_locked_down(LOCKDOWN_HIBERNATION) &&
+		!secretmem_active() && !cxl_mem_active();
+}
+
+bool hibernation_snapshot_dev_available(void)
+{
+	return nohibernate == 0 &&
+		(!security_locked_down(LOCKDOWN_HIBERNATION) ||
+		 IS_ENABLED(CONFIG_ENCRYPTED_HIBERNATION)) &&
 		!secretmem_active() && !cxl_mem_active();
 }
 
@@ -353,6 +362,7 @@ static int create_image(int platform_mode)
 		goto Power_up;
 
 	in_suspend = 1;
+	snapshot_encryption_capture_begin();
 	save_processor_state();
 	trace_suspend_resume(TPS("machine_suspend"), PM_EVENT_HIBERNATE, true);
 	error = swsusp_arch_suspend();
@@ -1378,12 +1388,35 @@ static ssize_t reserved_size_store(struct kobject *kobj,
 
 power_attr(reserved_size);
 
+#ifdef CONFIG_ENCRYPTED_HIBERNATION
+static ssize_t snapshot_seed_store(struct kobject *kobj,
+				   struct kobj_attribute *attr,
+				   const char *buf, size_t n)
+{
+	int ret;
+
+	ret = snapshot_store_encryption_seed(buf, n);
+	return ret ? ret : n;
+}
+
+static struct kobj_attribute snapshot_seed_attr = {
+	.attr	= {
+		.name = "snapshot_seed",
+		.mode = 0200,
+	},
+	.store	= snapshot_seed_store,
+};
+#endif
+
 static struct attribute *g[] = {
 	&disk_attr.attr,
 	&resume_offset_attr.attr,
 	&resume_attr.attr,
 	&image_size_attr.attr,
 	&reserved_size_attr.attr,
+#ifdef CONFIG_ENCRYPTED_HIBERNATION
+	&snapshot_seed_attr.attr,
+#endif
 	NULL,
 };
 
