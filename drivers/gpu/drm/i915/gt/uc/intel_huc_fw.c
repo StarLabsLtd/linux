@@ -48,6 +48,8 @@ int intel_huc_fw_auth_via_gsccs(struct intel_huc *huc)
 
 	msg_in = pkt_vaddr;
 	msg_out = pkt_vaddr + PXP43_HUC_AUTH_INOUT_SIZE;
+	memset(msg_in, 0, sizeof(*msg_in));
+	memset(msg_out, 0, sizeof(*msg_out));
 
 	intel_gsc_uc_heci_cmd_emit_mtl_header(&msg_in->header,
 					      HECI_MEADDRESS_PXP,
