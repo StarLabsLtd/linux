@@ -104,6 +104,9 @@ int xe_pxp_get_readiness_status(struct xe_pxp *pxp)
 	    xe_uc_fw_status_to_error(pxp->gt->uc.gsc.fw.status))
 		return -EIO;
 
+	if (pxp->gt->uc.gsc.proxy.error)
+		return -EIO;
+
 	guard(xe_pm_runtime)(pxp->xe);
 
 	/* PXP requires both HuC loaded and GSC proxy initialized */
