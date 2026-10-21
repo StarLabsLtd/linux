@@ -109,6 +109,9 @@ int xe_pxp_get_readiness_status(struct xe_pxp *pxp)
 	if (xe_uc_fw_status_to_error(pxp->gt->uc.gsc.fw.status))
 		return -EIO;
 
+	if (pxp->gt->uc.gsc.proxy.error)
+		return -EIO;
+
 	/* Same for HuC FW, but only if the kernel owns HuC-loading (i.e. pre-NVL) */
 	if (MEDIA_VER(gt_to_xe(pxp->gt)) < 35 &&
 	    xe_uc_fw_status_to_error(pxp->gt->uc.huc.fw.status))

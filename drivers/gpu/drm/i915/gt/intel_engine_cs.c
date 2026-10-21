@@ -1571,10 +1571,16 @@ void intel_engine_cleanup_common(struct intel_engine_cs *engine)
  */
 int intel_engine_resume(struct intel_engine_cs *engine)
 {
+	int err;
+
 	intel_engine_apply_workarounds(engine);
 	intel_engine_apply_whitelist(engine);
 
-	return engine->resume(engine);
+	err = engine->resume(engine);
+	if (!err)
+		intel_engine_resume__pm(engine);
+
+	return err;
 }
 
 u64 intel_engine_get_active_head(const struct intel_engine_cs *engine)
