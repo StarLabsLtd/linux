@@ -533,6 +533,7 @@ int xe_gsc_proxy_start(struct xe_gsc *gsc)
 	struct xe_gt *gt = gsc_to_gt(gsc);
 	int err;
 
+	gsc->proxy.error = 0;
 	/* enable the proxy interrupt in the GSC shim layer */
 	gsc_proxy_irq_toggle(gsc, true);
 
@@ -555,5 +556,6 @@ int xe_gsc_proxy_start(struct xe_gsc *gsc)
 
 err_irq_disable:
 	gsc_proxy_irq_toggle(gsc, false);
+	gsc->proxy.error = err;
 	return err;
 }

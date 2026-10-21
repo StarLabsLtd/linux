@@ -284,8 +284,11 @@ static int gsc_upload_and_init(struct xe_gsc *gsc)
 	if (tile->primary_gt && XE_GT_WA(tile->primary_gt, 14018094691))
 		xe_force_wake_put(gt_to_fw(tile->primary_gt), fw_ref);
 
-	if (ret)
+	if (ret) {
+		if (ret != -EEXIST)
+			xe_uc_fw_change_status(&gsc->fw, XE_UC_FIRMWARE_LOAD_FAIL);
 		return ret;
+	}
 
 	xe_uc_fw_change_status(&gsc->fw, XE_UC_FIRMWARE_TRANSFERRED);
 
@@ -370,9 +373,7 @@ static void gsc_work(struct work_struct *work)
 
 	if (actions & GSC_ACTION_FW_LOAD) {
 		ret = gsc_upload_and_init(gsc);
-		if (ret && ret != -EEXIST)
-			xe_uc_fw_change_status(&gsc->fw, XE_UC_FIRMWARE_LOAD_FAIL);
-		else
+		if (!ret || ret == -EEXIST)
 			xe_uc_fw_change_status(&gsc->fw, XE_UC_FIRMWARE_RUNNING);
 	}
 
