@@ -300,6 +300,11 @@ void intel_engine_init__pm(struct intel_engine_cs *engine)
 	intel_gsc_idle_msg_enable(engine);
 }
 
+void intel_engine_resume__pm(struct intel_engine_cs *engine)
+{
+	intel_gsc_idle_msg_enable(engine);
+}
+
 /**
  * intel_engine_reset_pinned_contexts - Reset the pinned contexts of
  * an engine.
