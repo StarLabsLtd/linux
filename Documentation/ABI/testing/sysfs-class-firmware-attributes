@@ -492,3 +492,26 @@ Description:
 		log entry size identifies audit log size for the current BIOS version.
 		The current size is 16 bytes but it can be up to 128 bytes long in future BIOS
 		versions.
+
+What:		/sys/class/firmware-attributes/*/attributes/*/help_text
+Date:		October 2026
+Contact:	coreboot mailing list <coreboot@coreboot.org>
+Description:
+		Optional read-only explanatory help text for an option, separate
+		from its display_name. Absent when firmware supplies no help.
+		Contains the complete firmware text followed by a newline; the
+		text may contain newlines. Text, newline and NUL must fit in one
+		sysfs page. coreboot-cfr obtains this from CFR UI_HELPTEXT records.
+
+What:		/sys/class/firmware-attributes/*/attributes/*/display_group
+Date:		October 2026
+Contact:	coreboot mailing list <coreboot@coreboot.org>
+Description:
+		Optional read-only display heading for grouping options. For
+		coreboot-cfr this is the full breadcrumb of enclosing named CFR
+		forms, from outermost to innermost, joined with " / ". Unnamed
+		forms retain the enclosing heading. Absent without a named form.
+		This is display text, not a machine identifier or a parseable
+		path: slashes in firmware titles are not escaped. Consumers must
+		display the whole string rather than split it into components.
+		The complete heading, trailing newline and NUL fit in one page.
