@@ -19,6 +19,10 @@
 #include <linux/efi.h>
 #include <linux/err.h>
 #include <linux/firmware_attributes.h>
+#if IS_ENABLED(CONFIG_X86)
+#include <linux/io.h>
+#include <linux/ioport.h>
+#endif
 #include <linux/kdev_t.h>
 #include <linux/kobject.h>
 #include <linux/kstrtox.h>
@@ -38,7 +42,11 @@
 
 #define LB_TAG_CFR_ROOT		0x47
 #define CFR_VERSION		0
+#define CFR_RUNTIME_APPLY_APM_CNT	1
 #define CFR_RUNTIME_APPLY_ACPI	2
+#define CFR_APM_CNT_COMMAND		0xe3
+#define CFR_APM_CNT_PORT		0xb2
+#define CFR_APM_STS_PORT		0xb3
 
 enum cfr_tags {
 	CFR_TAG_OPTION_FORM		= 1,
@@ -151,8 +159,8 @@ struct coreboot_cfr_setting {
 	u32 max;
 	u32 step;
 	u32 runtime_apply_id;
+	u32 runtime_apply_method;
 	bool read_only;
-	bool acpi_runtime;
 };
 
 struct coreboot_cfr_drvdata {
@@ -397,7 +405,16 @@ static int coreboot_cfr_check_runtime(struct coreboot_cfr_setting *setting)
 	acpi_status status;
 	int ret = -EIO;
 
-	if (!setting->acpi_runtime || !setting->drvdata->acpi_handle)
+	if (setting->runtime_apply_method == CFR_RUNTIME_APPLY_APM_CNT) {
+#if IS_ENABLED(CONFIG_X86)
+		return 0;
+#else
+		return -EOPNOTSUPP;
+#endif
+	}
+
+	if (setting->runtime_apply_method != CFR_RUNTIME_APPLY_ACPI ||
+	    !setting->drvdata->acpi_handle)
 		return -EOPNOTSUPP;
 
 	status = acpi_evaluate_object(setting->drvdata->acpi_handle,
@@ -462,6 +479,41 @@ static int coreboot_cfr_apply_runtime(struct coreboot_cfr_setting *setting,
 	acpi_status status;
 	int ret = -EIO;
 
+	if (setting->runtime_apply_method == CFR_RUNTIME_APPLY_APM_CNT) {
+#if IS_ENABLED(CONFIG_X86)
+		s8 apm_status;
+
+		if (!setting->runtime_apply_id ||
+		    setting->runtime_apply_id > U8_MAX)
+			return -EINVAL;
+
+		if (!request_region(CFR_APM_CNT_PORT, 2, DRIVER_NAME))
+			return -EBUSY;
+
+		outb(setting->runtime_apply_id, CFR_APM_STS_PORT);
+		outb(CFR_APM_CNT_COMMAND, CFR_APM_CNT_PORT);
+		apm_status = (s8)inb(CFR_APM_STS_PORT);
+		release_region(CFR_APM_CNT_PORT, 2);
+
+		switch (apm_status) {
+		case 0:
+			return 0;
+		case -2:
+			return -EINVAL;
+		case -3:
+			return -EOPNOTSUPP;
+		default:
+			return -EIO;
+		}
+#else
+		return -EOPNOTSUPP;
+#endif
+	}
+
+	if (setting->runtime_apply_method != CFR_RUNTIME_APPLY_ACPI ||
+	    !setting->drvdata->acpi_handle)
+		return -EOPNOTSUPP;
+
 	status = acpi_evaluate_object(setting->drvdata->acpi_handle,
 				      "CFRA", &args, &result);
 	object = result.pointer;
@@ -521,9 +573,12 @@ static int coreboot_cfr_write_value(struct coreboot_cfr_setting *setting,
 
 	if (live) {
 		ret = coreboot_cfr_apply_runtime(setting, value);
-		if (!ret)
+		if (!ret &&
+		    setting->runtime_apply_method == CFR_RUNTIME_APPLY_ACPI)
 			ret = coreboot_cfr_read_live_value(setting, &live_value);
-		if (!ret && live_value != value)
+		if (!ret &&
+		    setting->runtime_apply_method == CFR_RUNTIME_APPLY_ACPI &&
+		    live_value != value)
 			ret = -EIO;
 	}
 	notify = false;
@@ -697,11 +752,12 @@ static ssize_t current_value_show(struct kobject *kobj,
 	sleep_flags = lock_system_sleep();
 	mutex_lock(&setting->drvdata->lock);
 	ret = coreboot_cfr_check_runtime(setting);
-	if (!ret) {
+	if (!ret &&
+	    setting->runtime_apply_method == CFR_RUNTIME_APPLY_ACPI) {
 		ret = coreboot_cfr_read_live_value(setting, &value);
 		if (!ret && !coreboot_cfr_value_is_valid(setting, value))
 			ret = -EINVAL;
-	} else if (ret == -EOPNOTSUPP) {
+	} else if (!ret || ret == -EOPNOTSUPP) {
 		ret = coreboot_cfr_read_value(setting, &value, NULL);
 	}
 	mutex_unlock(&setting->drvdata->lock);
@@ -1060,8 +1116,14 @@ static int coreboot_cfr_add_numeric_option(struct coreboot_cfr_drvdata *data,
 		ret = PTR_ERR(runtime_apply);
 		goto err_put_setting;
 	}
-	if (runtime_apply && runtime_apply->method == CFR_RUNTIME_APPLY_ACPI) {
-		setting->acpi_runtime = true;
+	/* A zero ID is indistinguishable from a successful APM status. */
+	if (runtime_apply && runtime_apply->method == CFR_RUNTIME_APPLY_APM_CNT &&
+	    runtime_apply->id && runtime_apply->id <= U8_MAX) {
+		setting->runtime_apply_method = runtime_apply->method;
+		setting->runtime_apply_id = runtime_apply->id;
+	} else if (runtime_apply &&
+		   runtime_apply->method == CFR_RUNTIME_APPLY_ACPI) {
+		setting->runtime_apply_method = runtime_apply->method;
 		setting->runtime_apply_id = runtime_apply->id;
 	}
 
