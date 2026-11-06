@@ -2387,6 +2387,8 @@ static int hci_suspend_notifier(struct notifier_block *nb, unsigned long action,
 	switch (action) {
 	case PM_HIBERNATION_PREPARE:
 	case PM_SUSPEND_PREPARE:
+		/* Finish controller setup before the powered-state check. */
+		flush_work(&hdev->power_on);
 		ret = hci_suspend_dev(hdev);
 		break;
 	case PM_POST_HIBERNATION:
