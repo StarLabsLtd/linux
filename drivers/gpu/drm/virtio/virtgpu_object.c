@@ -308,11 +308,15 @@ int virtio_gpu_object_restore_all(struct virtio_gpu_device *vgdev)
 	mutex_lock(&vgdev->obj_restore_lock);
 	list_for_each_entry_safe(bo, tmp, &vgdev->obj_restore_list,
 				 restore_node) {
+		if (!bo->needs_restore)
+			continue;
+
 		if (drm_gem_is_imported(&bo->base.base)) {
 			ret = virtgpu_dma_buf_obj_resubmit(vgdev, bo);
 			if (ret)
 				break;
 
+			bo->needs_restore = false;
 			continue;
 		}
 
@@ -336,6 +340,7 @@ int virtio_gpu_object_restore_all(struct virtio_gpu_device *vgdev)
 							 nents);
 			}
 		}
+		bo->needs_restore = false;
 	}
 	mutex_unlock(&vgdev->obj_restore_lock);
 
@@ -354,6 +359,7 @@ void virtio_gpu_object_unref_all(struct virtio_gpu_device *vgdev)
 				 restore_node)
 		if (bo->created) {
 			virtio_gpu_cmd_unref_resource(vgdev, bo, true);
+			bo->needs_restore = true;
 			virtio_gpu_notify(vgdev);
 		}
 

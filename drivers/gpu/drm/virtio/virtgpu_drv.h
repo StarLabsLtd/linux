@@ -125,6 +125,7 @@ struct virtio_gpu_object {
 	/* for restoration of objects after hibernation */
 	struct virtio_gpu_object_params params;
 	struct list_head restore_node;
+	bool needs_restore;
 };
 #define gem_to_virtio_gpu_obj(gobj) \
 	container_of((gobj), struct virtio_gpu_object, base.base)

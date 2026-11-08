@@ -152,11 +152,6 @@ static int virtio_gpu_pm_notifier(struct notifier_block *nb, unsigned long mode,
 			return notifier_from_errno(-EPERM);
 		}
 
-		vgdev->hibernated = true;
-		break;
-
-	case PM_POST_HIBERNATION:
-		vgdev->hibernated = false;
 		break;
 	}
 

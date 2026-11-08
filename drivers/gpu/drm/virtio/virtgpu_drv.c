@@ -170,12 +170,19 @@ static unsigned int features[] = {
 };
 
 #ifdef CONFIG_PM_SLEEP
-static void virtgpu_hibernation_restore(struct virtio_gpu_device *vgdev)
+static int virtgpu_hibernation_restore(struct virtio_gpu_device *vgdev)
 {
-	if (vgdev->hibernated) {
-		vgdev->hibernated = false;
-		virtio_gpu_object_restore_all(vgdev);
-	}
+	int error;
+
+	if (!vgdev->hibernated)
+		return 0;
+
+	error = virtio_gpu_object_restore_all(vgdev);
+	if (error)
+		return error;
+
+	vgdev->hibernated = false;
+	return 0;
 }
 
 static int virtgpu_freeze(struct virtio_device *vdev)
@@ -184,14 +191,18 @@ static int virtgpu_freeze(struct virtio_device *vdev)
 	struct virtio_gpu_device *vgdev = dev->dev_private;
 	int error;
 
+	if (vgdev->has_virgl_3d)
+		return -EOPNOTSUPP;
+
 	error = drm_mode_config_helper_suspend(dev);
 	if (error) {
 		DRM_ERROR("suspend error: %d\n", error);
 		return error;
 	}
 
-	if (vgdev->hibernated)
-		virtio_gpu_object_unref_all(vgdev);
+	/* Each freeze invalidates host resources, including snapshot retries. */
+	vgdev->hibernated = true;
+	virtio_gpu_object_unref_all(vgdev);
 
 	flush_work(&vgdev->obj_free_work);
 	flush_work(&vgdev->ctrlq.dequeue_work);
@@ -216,9 +227,8 @@ static int virtgpu_freeze(struct virtio_device *vdev)
 	return 0;
 
 err_resume:
-	virtgpu_hibernation_restore(vgdev);
-
-	drm_mode_config_helper_resume(dev);
+	if (!virtgpu_hibernation_restore(vgdev))
+		drm_mode_config_helper_resume(dev);
 
 	return error;
 }
@@ -237,7 +247,9 @@ static int virtgpu_restore(struct virtio_device *vdev)
 
 	virtio_device_ready(vdev);
 
-	virtgpu_hibernation_restore(vgdev);
+	error = virtgpu_hibernation_restore(vgdev);
+	if (error)
+		return error;
 
 	error = drm_mode_config_helper_resume(dev);
 	if (error) {
