@@ -81,6 +81,7 @@ int snapshot_set_user_key(struct snapshot_data *data,
 			  struct uswsusp_user_key __user *key);
 
 int snapshot_store_encryption_seed(const char *buf, size_t count);
+bool snapshot_encryption_restore_allowed(void);
 
 loff_t snapshot_get_encrypted_image_size(struct snapshot_data *data,
 					 loff_t raw_size);
@@ -151,6 +152,11 @@ static inline loff_t snapshot_get_encrypted_image_size(struct snapshot_data *dat
 static inline int snapshot_finalize_decrypted_image(struct snapshot_data *data)
 {
 	return -ENOTTY;
+}
+
+static inline bool snapshot_encryption_restore_allowed(void)
+{
+	return false;
 }
 
 static inline bool snapshot_encryption_failed(struct snapshot_data *data)

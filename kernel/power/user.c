@@ -616,6 +616,11 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 			error = -EPERM;
 			break;
 		}
+		if (snapshot_encryption_enabled(data) &&
+		    !snapshot_encryption_restore_allowed()) {
+			error = -EPERM;
+			break;
+		}
 		if (!data->image_finalized) {
 			if (snapshot_encryption_enabled(data)) {
 				error = snapshot_finalize_decrypted_image(data);

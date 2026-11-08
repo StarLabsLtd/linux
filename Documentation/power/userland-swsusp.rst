@@ -149,6 +149,15 @@ SNAPSHOT_ENABLE_ENCRYPTION
 	valid if its authentication succeeds; this interface does not enforce
 	image freshness or prevent rollback.
 
+	The first seed writer must run in a dedicated POSIX process session;
+	the default bootstrap session is refused. The kernel binds encrypted
+	key loading and atomic restore to that session's identity. Fork/exec
+	descendants may restore, but rewriting the same seed does not transfer
+	permission to another session. Image capture is not restricted to it.
+	The initrd restore service must finish before untrusted ROOT/login and
+	must not leave a runtime restore proxy. Holding the original session
+	identity prevents later numeric SID reuse from regaining permission.
+
 	Trusted early userspace must provision the seed before untrusted
 	privileged code can run. The deployment must also check freshness on
 	every authorized restore, including restores requested later by

@@ -9,6 +9,8 @@
 #include <linux/hex.h>
 #include <linux/mutex.h>
 #include <linux/random.h>
+#include <linux/pid.h>
+#include <linux/sched/signal.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -36,6 +38,7 @@ struct snapshot_wrapped_key {
 static DEFINE_MUTEX(snapshot_seed_mutex);
 static u8 snapshot_seed[SNAPSHOT_SEED_SIZE] __nonstring;
 static bool snapshot_seed_valid;
+static struct pid *snapshot_restore_session;
 
 int snapshot_store_encryption_seed(const char *buf, size_t count)
 {
@@ -58,6 +61,17 @@ int snapshot_store_encryption_seed(const char *buf, size_t count)
 		goto out;
 	}
 
+	/* Keep object identity across exit and numeric SID reuse. */
+	rcu_read_lock();
+	snapshot_restore_session = get_pid(task_session(current));
+	rcu_read_unlock();
+	/* The initrd must provision from a dedicated process session. */
+	if (pid_nr(snapshot_restore_session) <= 1) {
+		put_pid(snapshot_restore_session);
+		snapshot_restore_session = NULL;
+		ret = -EPERM;
+		goto out;
+	}
 	memcpy(snapshot_seed, seed, sizeof(seed));
 	snapshot_seed_valid = true;
 	pr_info("PM: hibernate: snapshot encryption seed locked\n");
@@ -67,6 +81,19 @@ out:
 out_wipe:
 	memzero_explicit(seed, sizeof(seed));
 	return ret;
+}
+
+bool snapshot_encryption_restore_allowed(void)
+{
+	bool allowed;
+
+	mutex_lock(&snapshot_seed_mutex);
+	rcu_read_lock();
+	allowed = snapshot_seed_valid &&
+		snapshot_restore_session == task_session(current);
+	rcu_read_unlock();
+	mutex_unlock(&snapshot_seed_mutex);
+	return allowed;
 }
 
 static bool snapshot_copy_encryption_seed(u8 seed[SNAPSHOT_SEED_SIZE])
@@ -800,6 +827,8 @@ int snapshot_set_encryption_key(struct snapshot_data *data,
 
 	if (data->crypt_failed)
 		return -EPIPE;
+	if (!snapshot_encryption_restore_allowed())
+		return -EPERM;
 	if (data->aead_tfm)
 		return -EINVAL;
 
