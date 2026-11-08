@@ -847,7 +847,8 @@ int snapshot_set_user_key(struct snapshot_data *data,
 {
 	struct uswsusp_user_key user_key = {};
 	unsigned int key_len;
-	u64 size;
+	u64 meta_size = data->meta_size;
+	u64 crypt_meta_size;
 	int rc;
 
 	if (!snapshot_encryption_enabled(data))
@@ -885,31 +886,30 @@ int snapshot_set_user_key(struct snapshot_data *data,
 	 * Return the metadata size, the number of bytes that can be fed in before
 	 * the user data key is needed at resume time.
 	 */
-	if (data->mode == O_WRONLY && !data->meta_size) {
+	if (data->mode == O_WRONLY && !meta_size) {
 		if (user_key.meta_size < PAGE_SIZE + SNAPSHOT_AUTH_TAG_SIZE)
 			goto out;
 
-		data->crypt_meta_size = user_key.meta_size;
-		size = data->crypt_meta_size;
+		crypt_meta_size = user_key.meta_size;
 	} else {
-		snapshot_set_meta_size(data,
-				       snapshot_get_meta_page_count() << PAGE_SHIFT);
-		size = data->crypt_meta_size;
+		meta_size = (u64)snapshot_get_meta_page_count() << PAGE_SHIFT;
+		crypt_meta_size = snapshot_encrypted_byte_count(meta_size);
 	}
 
-	rc = put_user(size, &key->meta_size);
+	/* Don't allow it if it's too late. */
+	if ((meta_size && data->crypt_total > meta_size) ||
+	    data->crypt_stream_total > crypt_meta_size) {
+		rc = -EBUSY;
+		goto out;
+	}
+
+	rc = put_user(crypt_meta_size, &key->meta_size);
 	if (rc)
 		goto out;
 
 	key_len = user_key.key_len;
-
-	/* Don't allow it if it's too late. */
-	if ((data->meta_size && data->crypt_total > data->meta_size) ||
-	    (data->crypt_meta_size &&
-	     data->crypt_stream_total > data->crypt_meta_size)) {
-		rc = -EBUSY;
-		goto out;
-	}
+	data->meta_size = meta_size;
+	data->crypt_meta_size = crypt_meta_size;
 
 	/*
 	 * Resume may preload the user key before writing any image data, or
