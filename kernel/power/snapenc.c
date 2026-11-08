@@ -436,7 +436,7 @@ static int snapshot_decrypt_drain(struct snapshot_data *data)
 		if (res < 0)
 			return res;
 		if (res == 0)
-			break;
+			return -EINVAL;
 
 		if (!data_of(data->handle))
 			return -EINVAL;
@@ -535,6 +535,23 @@ static ssize_t snapshot_write_next_encrypted(struct snapshot_data *data,
 	return size_avail;
 }
 
+int snapshot_fail_encryption(struct snapshot_data *data, int error)
+{
+	u64 total = data->crypt_total;
+	u64 stream_total = data->crypt_stream_total;
+	bool retirement_required = data->encryption_retirement_required;
+
+	snapshot_teardown_encryption(data);
+	/* Ciphertext already exported still requires generation retirement. */
+	data->crypt_total = total;
+	data->crypt_stream_total = stream_total;
+	data->encryption_retirement_required = retirement_required;
+	data->crypt_failed = true;
+	data->ready = false;
+	data->image_finalized = false;
+	return error;
+}
+
 ssize_t snapshot_read_encrypted(struct snapshot_data *data,
 				char __user *buf, size_t count, loff_t *offp)
 {
@@ -544,6 +561,8 @@ ssize_t snapshot_read_encrypted(struct snapshot_data *data,
 	void *src;
 	ssize_t src_size;
 
+	if (data->crypt_failed)
+		return -EPIPE;
 	if (!count)
 		return 0;
 
@@ -551,8 +570,10 @@ ssize_t snapshot_read_encrypted(struct snapshot_data *data,
 	count = min_t(size_t, count, PAGE_SIZE - pg_off);
 
 	src_size = snapshot_read_next_encrypted(data, &src);
-	if (src_size <= 0)
-		return src_size;
+	if (src_size < 0)
+		return snapshot_fail_encryption(data, src_size);
+	if (!src_size)
+		return 0;
 
 	copy_size = min_t(size_t, count, src_size);
 	not_done = copy_to_user(buf, src, copy_size);
@@ -576,6 +597,8 @@ ssize_t snapshot_write_encrypted(struct snapshot_data *data,
 	ssize_t dst_size;
 	int rc;
 
+	if (data->crypt_failed)
+		return -EPIPE;
 	if (!count)
 		return 0;
 
@@ -583,8 +606,10 @@ ssize_t snapshot_write_encrypted(struct snapshot_data *data,
 	count = min_t(size_t, count, PAGE_SIZE - pg_off);
 
 	dst_size = snapshot_write_next_encrypted(data, &dst);
-	if (dst_size <= 0)
-		return dst_size;
+	if (dst_size < 0)
+		return snapshot_fail_encryption(data, dst_size);
+	if (!dst_size)
+		return 0;
 
 	copy_size = min_t(size_t, count, dst_size);
 	not_done = copy_from_user(dst, buf, copy_size);
@@ -604,7 +629,7 @@ ssize_t snapshot_write_encrypted(struct snapshot_data *data,
 	     data->crypt_stream_total == data->crypt_meta_size)) {
 		rc = snapshot_decrypt_drain(data);
 		if (rc < 0)
-			return rc;
+			return snapshot_fail_encryption(data, rc);
 	}
 
 	*offp += copy_size;
@@ -711,15 +736,17 @@ int snapshot_get_encryption_key(struct snapshot_data *data,
 	int rc;
 
 	/* Don't pull a random key from a world that can be reset. */
-	if (data->ready)
+	if (data->crypt_failed || data->ready)
 		return -EPIPE;
+	if (data->aead_tfm)
+		return -EINVAL;
 	/* The ioctl holds system_transition_mutex and device_hotplug_lock. */
 	if (!rng_is_initialized())
 		return -EAGAIN;
 
 	rc = snapshot_setup_encryption_common(data);
 	if (rc)
-		return rc;
+		return snapshot_fail_encryption(data, rc);
 
 	/* Build a random starting nonce. */
 	get_random_bytes(nonce, sizeof(nonce));
@@ -760,8 +787,7 @@ int snapshot_get_encryption_key(struct snapshot_data *data,
 fail:
 	memzero_explicit(image_key, sizeof(image_key));
 	memzero_explicit(&wrapped, sizeof(wrapped));
-	snapshot_teardown_encryption(data);
-	return rc;
+	return snapshot_fail_encryption(data, rc);
 }
 
 int snapshot_set_encryption_key(struct snapshot_data *data,
@@ -772,13 +798,18 @@ int snapshot_set_encryption_key(struct snapshot_data *data,
 	u8 image_key[SNAPSHOT_ENCRYPTION_KEY_SIZE] __nonstring = {};
 	int rc;
 
+	if (data->crypt_failed)
+		return -EPIPE;
+	if (data->aead_tfm)
+		return -EINVAL;
+
 	/* It's too late if data's been pushed in. */
 	if (data->handle.cur)
 		return -EPIPE;
 
 	rc = snapshot_setup_encryption_common(data);
 	if (rc)
-		return rc;
+		return snapshot_fail_encryption(data, rc);
 
 	/* Load the key from user mode. */
 	blob = memdup_user(key, sizeof(*blob));
@@ -817,8 +848,7 @@ out_blob:
 crypto_setup_fail:
 	memzero_explicit(&wrapped, sizeof(wrapped));
 	memzero_explicit(image_key, sizeof(image_key));
-	snapshot_teardown_encryption(data);
-	return rc;
+	return snapshot_fail_encryption(data, rc);
 }
 
 static loff_t snapshot_encrypted_byte_count(loff_t plain_size)
@@ -851,6 +881,8 @@ int snapshot_set_user_key(struct snapshot_data *data,
 	u64 crypt_meta_size;
 	int rc;
 
+	if (data->crypt_failed)
+		return -EPIPE;
 	if (!snapshot_encryption_enabled(data))
 		return -EINVAL;
 
@@ -921,10 +953,12 @@ int snapshot_set_user_key(struct snapshot_data *data,
 	    data->crypt_stream_total == data->crypt_meta_size &&
 	    data->crypt_offset) {
 		rc = snapshot_decrypt_drain(data);
-		if (rc)
+		if (rc) {
+			rc = snapshot_fail_encryption(data, rc);
 			goto out;
+		}
 		if (data->crypt_total != data->meta_size) {
-			rc = -EINVAL;
+			rc = snapshot_fail_encryption(data, -EINVAL);
 			goto out;
 		}
 	}
@@ -934,8 +968,10 @@ int snapshot_set_user_key(struct snapshot_data *data,
 	data->user_key_valid = true;
 	/* Install the key if the user is just under the wire. */
 	rc = snapshot_check_user_key_switch(data);
-	if (rc)
+	if (rc) {
+		rc = snapshot_fail_encryption(data, rc);
 		goto out;
+	}
 	if (user_key.reserved & USWSUSP_USER_KEY_REQUIRE_RETIREMENT)
 		data->encryption_retirement_required = true;
 
@@ -962,18 +998,22 @@ loff_t snapshot_get_encrypted_image_size(struct snapshot_data *data,
 
 int snapshot_finalize_decrypted_image(struct snapshot_data *data)
 {
+	u64 expected_size;
 	int rc;
 
+	if (data->crypt_failed)
+		return -EPIPE;
 	if (data->crypt_offset != 0) {
 		rc = snapshot_decrypt_drain(data);
 		if (rc)
-			return rc;
+			return snapshot_fail_encryption(data, rc);
 	}
 
-	/* Finalization must not advance past pages absent from the stream. */
-	if (data->handle.cur <= 1 ||
-	    data->crypt_total != (u64)snapshot_get_image_size() << PAGE_SHIFT)
-		return -ENODATA;
+	rc = snapshot_get_image_size_for_restore(&data->handle, &expected_size);
+	if (rc)
+		return snapshot_fail_encryption(data, rc);
+	if (data->crypt_total != expected_size)
+		return snapshot_fail_encryption(data, -ENODATA);
 
 	return 0;
 }

@@ -362,6 +362,7 @@ static int create_image(int platform_mode)
 		goto Power_up;
 
 	in_suspend = 1;
+	snapshot_encryption_capture_begin();
 	save_processor_state();
 	trace_suspend_resume(TPS("machine_suspend"), PM_EVENT_HIBERNATE, true);
 	error = swsusp_arch_suspend();

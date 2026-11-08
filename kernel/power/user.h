@@ -24,6 +24,7 @@ struct snapshot_data {
 	bool frozen;
 	bool ready;
 	bool image_finalized;
+	bool crypt_failed;
 	bool platform_support;
 	bool free_bitmaps;
 	bool encryption_required;
@@ -68,6 +69,8 @@ ssize_t snapshot_write_encrypted(struct snapshot_data *data,
 				 loff_t *offp);
 
 void snapshot_teardown_encryption(struct snapshot_data *data);
+int snapshot_fail_encryption(struct snapshot_data *data, int error);
+void snapshot_encryption_capture_begin(void);
 int snapshot_get_encryption_key(struct snapshot_data *data,
 				struct uswsusp_key_blob __user *key);
 
@@ -83,6 +86,11 @@ loff_t snapshot_get_encrypted_image_size(struct snapshot_data *data,
 					 loff_t raw_size);
 
 int snapshot_finalize_decrypted_image(struct snapshot_data *data);
+
+static inline bool snapshot_encryption_failed(struct snapshot_data *data)
+{
+	return data->crypt_failed;
+}
 
 static inline bool snapshot_encryption_enabled(struct snapshot_data *data)
 {
@@ -106,6 +114,11 @@ static inline ssize_t snapshot_write_encrypted(struct snapshot_data *data,
 }
 
 static inline void snapshot_teardown_encryption(struct snapshot_data *data) {}
+static inline int snapshot_fail_encryption(struct snapshot_data *data, int error)
+{
+	return error;
+}
+static inline void snapshot_encryption_capture_begin(void) {}
 static inline int snapshot_get_encryption_key(struct snapshot_data *data,
 					      struct uswsusp_key_blob __user *key)
 {
@@ -138,6 +151,11 @@ static inline loff_t snapshot_get_encrypted_image_size(struct snapshot_data *dat
 static inline int snapshot_finalize_decrypted_image(struct snapshot_data *data)
 {
 	return -ENOTTY;
+}
+
+static inline bool snapshot_encryption_failed(struct snapshot_data *data)
+{
+	return false;
 }
 
 static inline bool snapshot_encryption_enabled(struct snapshot_data *data)
