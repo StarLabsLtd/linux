@@ -623,9 +623,17 @@ static int __maybe_unused iTCO_wdt_suspend_noirq(struct device *dev)
 static int __maybe_unused iTCO_wdt_resume_noirq(struct device *dev)
 {
 	struct iTCO_wdt_private *p = dev_get_drvdata(dev);
+	int ret;
+
+	ret = iTCO_wdt_set_timeout(&p->wddev, p->wddev.timeout);
+	if (ret)
+		return ret;
 
 	if (p->suspended)
-		iTCO_wdt_start(&p->wddev);
+		return iTCO_wdt_start(&p->wddev);
+
+	if (watchdog_hw_running(&p->wddev))
+		return iTCO_wdt_ping(&p->wddev);
 
 	return 0;
 }
