@@ -713,6 +713,9 @@ int snapshot_get_encryption_key(struct snapshot_data *data,
 	/* Don't pull a random key from a world that can be reset. */
 	if (data->ready)
 		return -EPIPE;
+	/* The ioctl holds system_transition_mutex and device_hotplug_lock. */
+	if (!rng_is_initialized())
+		return -EAGAIN;
 
 	rc = snapshot_setup_encryption_common(data);
 	if (rc)
