@@ -20,6 +20,7 @@
 #include <linux/kernel.h>
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
+#include <linux/pci.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/pm_runtime.h>
@@ -130,6 +131,22 @@ static int i2c_dw_probe_lock_support(struct dw_i2c_dev *dev)
 	return 0;
 }
 
+static unsigned int dw_i2c_plat_autosuspend_delay(struct device *device)
+{
+	struct pci_dev *pdev;
+
+	if (device->parent && dev_is_pci(device->parent) &&
+	    dmi_match(DMI_SYS_VENDOR, "Star Labs") &&
+	    dmi_match(DMI_PRODUCT_NAME, "StarFighter") &&
+	    dmi_match(DMI_PRODUCT_SKU, "F2")) {
+		pdev = to_pci_dev(device->parent);
+		if (pdev->vendor == PCI_VENDOR_ID_INTEL && pdev->device == 0x7e78)
+			return 100;
+	}
+
+	return 1000;
+}
+
 static int dw_i2c_plat_probe(struct platform_device *pdev)
 {
 	u32 flags = (uintptr_t)device_get_match_data(&pdev->dev);
@@ -215,7 +232,7 @@ static int dw_i2c_plat_probe(struct platform_device *pdev)
 	/* The code below assumes runtime PM to be disabled. */
 	WARN_ON(pm_runtime_enabled(device));
 
-	pm_runtime_set_autosuspend_delay(device, 1000);
+	pm_runtime_set_autosuspend_delay(device, dw_i2c_plat_autosuspend_delay(device));
 	pm_runtime_use_autosuspend(device);
 	pm_runtime_set_active(device);
 
