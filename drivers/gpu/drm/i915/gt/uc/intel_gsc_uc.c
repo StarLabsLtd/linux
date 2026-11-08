@@ -64,12 +64,10 @@ static void gsc_work(struct work_struct *work)
 		ret = intel_gsc_proxy_request_handler(gsc);
 		if (ret) {
 			if (actions & GSC_ACTION_FW_LOAD) {
-				/*
-				 * A proxy failure right after firmware load means the proxy-init
-				 * step has failed so mark GSC as not usable after this
-				 */
+				/* Keep the loaded firmware eligible for reload after power loss. */
 				gt_err(gt, "GSC proxy handler failed to init\n");
-				intel_uc_fw_change_status(&gsc->fw, INTEL_UC_FIRMWARE_LOAD_FAIL);
+				intel_uc_fw_change_status(&gsc->fw,
+							  INTEL_UC_FIRMWARE_TRANSFERRED);
 			}
 			goto out_put;
 		}
@@ -86,7 +84,8 @@ static void gsc_work(struct work_struct *work)
 				intel_uc_fw_change_status(&gsc->fw, INTEL_UC_FIRMWARE_RUNNING);
 			} else {
 				gt_err(gt, "GSC status reports proxy init not complete\n");
-				intel_uc_fw_change_status(&gsc->fw, INTEL_UC_FIRMWARE_LOAD_FAIL);
+				intel_uc_fw_change_status(&gsc->fw,
+							  INTEL_UC_FIRMWARE_TRANSFERRED);
 			}
 		}
 	}
