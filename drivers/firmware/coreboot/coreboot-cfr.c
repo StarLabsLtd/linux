@@ -14,6 +14,7 @@
 #include <linux/container_of.h>
 #include <linux/crc32.h>
 #include <linux/ctype.h>
+#include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/device-id/coreboot.h>
 #include <linux/efi.h>
@@ -649,24 +650,32 @@ static int coreboot_cfr_apply_runtime(struct coreboot_cfr_setting *setting,
 		    setting->runtime_apply_id > U8_MAX)
 			return -EINVAL;
 
-		if (!request_region(CFR_APM_CNT_PORT, 2, DRIVER_NAME))
-			return -EBUSY;
+		/* Let the OS and asynchronous device changes progress between attempts. */
+		for (int attempt = 0; attempt < 10; attempt++) {
+			if (!request_region(CFR_APM_CNT_PORT, 2, DRIVER_NAME))
+				return -EBUSY;
 
-		outb(setting->runtime_apply_id, CFR_APM_STS_PORT);
-		outb(CFR_APM_CNT_COMMAND, CFR_APM_CNT_PORT);
-		apm_status = (s8)inb(CFR_APM_STS_PORT);
-		release_region(CFR_APM_CNT_PORT, 2);
+			outb(setting->runtime_apply_id, CFR_APM_STS_PORT);
+			outb(CFR_APM_CNT_COMMAND, CFR_APM_CNT_PORT);
+			apm_status = (s8)inb(CFR_APM_STS_PORT);
+			release_region(CFR_APM_CNT_PORT, 2);
 
-		switch (apm_status) {
-		case 0:
-			return 0;
-		case -2:
-			return -EINVAL;
-		case -3:
-			return -EOPNOTSUPP;
-		default:
-			return -EIO;
+			switch (apm_status) {
+			case 0:
+				return 0;
+			case -2:
+				return -EINVAL;
+			case -3:
+				return -EOPNOTSUPP;
+			case -4:
+				if (attempt < 9)
+					usleep_range(100000, 125000);
+				break;
+			default:
+				return -EIO;
+			}
 		}
+		return -EBUSY;
 #else
 		return -EOPNOTSUPP;
 #endif
