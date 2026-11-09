@@ -656,7 +656,7 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 		snapshot_teardown_encryption(data);
 		data->encryption_output_retired = false;
 		data->image_finalized = false;
-	data->crypt_failed = false;
+		data->crypt_failed = false;
 #if defined(CONFIG_ENCRYPTED_HIBERNATION)
 		snapshot_reset_swap_write_state(data, false);
 #endif
