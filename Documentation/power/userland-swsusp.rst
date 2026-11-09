@@ -59,7 +59,9 @@ SNAPSHOT_ATOMIC_RESTORE
 	image is not available to the kernel
 
 SNAPSHOT_FREE
-	free memory allocated for the snapshot image
+	free memory allocated for the snapshot image. When retirement is not pending,
+	this resets a failed encrypted session. Fresh encryption setup is
+	required before another encrypted SNAPSHOT_CREATE_IMAGE.
 
 SNAPSHOT_PREF_IMAGE_SIZE
 	set the preferred maximum size of the image
@@ -71,6 +73,9 @@ SNAPSHOT_GET_IMAGE_SIZE
 	return the actual size of the hibernation image
 	(the last argument should be a pointer to a loff_t variable that
 	will contain the result if the call is successful)
+
+	With encryption enabled, the size reflects the current key setup.
+	Query it again after SNAPSHOT_SET_USER_KEY changes the framing.
 
 SNAPSHOT_AVAIL_SWAP_SIZE
 	return the amount of available swap in bytes
@@ -85,6 +90,12 @@ SNAPSHOT_ALLOC_SWAP_PAGE
 SNAPSHOT_FREE_SWAP_PAGES
 	free all swap pages allocated by
 	SNAPSHOT_ALLOC_SWAP_PAGE
+	For an output that requires retirement (see SNAPSHOT_SET_USER_KEY),
+	this also acknowledges retirement, prohibits further output and thaws
+	kernel threads. Swap-header cleanup remains available to the owner even
+	if the encryption context has been destroyed.
+	User space must retire the image's freshness generation before this
+	call releases any swap pages. An error does not acknowledge retirement.
 
 SNAPSHOT_SET_SWAP_AREA
 	set the resume partition and the offset (in <PAGE_SIZE>
@@ -114,6 +125,99 @@ SNAPSHOT_S2RAM
 	to disk, and then the system is suspended to RAM (this makes it possible
 	to resume the system from RAM if there's enough battery power or restore
 	its state on the basis of the saved suspend image otherwise)
+	The sleep mode is selected by /sys/power/mem_sleep, as with built-in
+	hybrid hibernation.
+	An encrypted session that reaches suspend and returns, including an
+	error return, loses its keys and staged output. Reads, writes and new
+	capture or key setup fail until SNAPSHOT_FREE or close/reopen. An
+	outstanding generation-retirement obligation survives key destruction.
+
+SNAPSHOT_ENABLE_ENCRYPTION
+	Enables encryption of the hibernate image within the kernel. Trusted
+	early userspace must write the 32-byte snapshot encryption seed to
+	/sys/power/snapshot_seed before calling this ioctl. Upon suspend
+	(ie when the snapshot device was opened for reading), this ioctl returns
+	an opaque wrapped key blob and the starting nonce. Upon resume (ie when
+	the snapshot device was opened for writing), this ioctl receives the
+	same blob and nonce from usermode after the same seed has been written
+	to /sys/power/snapshot_seed. The plaintext image key is generated and
+	unwrapped inside the kernel.
+
+	The first successful seed write establishes the wrapping key for that
+	boot. The kernel does not authenticate the writer or the TPM policy used
+	to unseal the seed. An older image encrypted with the same seed is still
+	valid if its authentication succeeds; this interface does not enforce
+	image freshness or prevent rollback.
+
+	The first seed writer must run in a dedicated POSIX process session;
+	the default bootstrap session is refused. The kernel binds encrypted
+	key loading and atomic restore to that session's identity. Fork/exec
+	descendants may restore, but rewriting the same seed does not transfer
+	permission to another session. Image capture is not restricted to it.
+	The initrd restore service must finish before untrusted ROOT/login and
+	must not leave a runtime restore proxy. Holding the original session
+	identity prevents later numeric SID reuse from regaining permission.
+
+	Trusted early userspace must provision the seed before untrusted
+	privileged code can run. The deployment must also check freshness on
+	every authorized restore, including restores requested later by
+	privileged callers. Selecting a fresh image only during initial boot is
+	not sufficient. This interface provides no monotonic counter or other
+	freshness mechanism, so rollback protection remains a deployment
+	requirement. Without a trusted check on every restore, rollback
+	protection is unresolved.
+
+	Under lockdown, direct block-device write() calls to the selected swap
+	backend are restricted to the process which owns the snapshot device.
+	Image writes require a ready encrypted image, allocated swap extents and
+	the image-byte budget. Header cleanup is confined to the validated header
+	page and remains permitted after S2RAM or SNAPSHOT_FREE while the owning
+	session retains the pinned backend. Both use synchronous buffered I/O
+	(O_DSYNC without O_DIRECT); asynchronous writes are not permitted.
+
+SNAPSHOT_FINALIZE_ENCRYPTED_IMAGE
+	Authenticate any buffered final chunk and finish loading the encrypted
+	image without restoring memory. Requires CAP_SYS_ADMIN, a device opened
+	for writing and enabled encryption. Takes no argument and may be called
+	before SNAPSHOT_FREEZE so a userspace counter helper can still run.
+	Returns zero only when the complete image is loaded, or ENODATA for an
+	incomplete image; authentication and loading errors are propagated.
+	Authentication or loading failure latches the session unusable until
+	SNAPSHOT_FREE or close/reopen; retries cannot finish a rejected prefix.
+	Success prohibits further writes and key changes until SNAPSHOT_FREE.
+	Repeated calls after success are harmless. Userspace may then advance
+	its freshness counter before calling SNAPSHOT_ATOMIC_RESTORE, which
+	still performs finalization for callers that omit this ioctl.
+
+SNAPSHOT_SET_USER_KEY
+	Mixes additional user key material into the data portion of an encrypted
+	hibernate image. The ioctl argument points to struct uswsusp_user_key.
+	key_len must be between 8 and USWSUSP_USER_KEY_SIZE bytes. During
+	hibernation the kernel writes meta_size with the encrypted metadata
+	size. During resume, userspace passes the saved
+	meta_size back so the kernel can switch keys at the metadata boundary
+	before the snapshot header has been decrypted.
+	Validation and user-copy failures preserve the previous configuration.
+	Failure after metadata drain or crypto switching invalidates the session
+	until SNAPSHOT_FREE or close/reopen.
+
+	The reserved field accepts USWSUSP_USER_KEY_REQUIRE_RETIREMENT; all other
+	bits must be zero. This flag is only valid for an encrypted device opened
+	for reading with a selected swap area, before any ciphertext is generated.
+	Once accepted, later key calls cannot clear it. Zero preserves the usual
+	cleanup contract for encrypted callers, including non-swap backends.
+
+	After ciphertext generation starts, SNAPSHOT_FREE and SNAPSHOT_UNFREEZE
+	fail until retirement is acknowledged. New SNAPSHOT_CREATE_IMAGE calls
+	also fail while output is pending or retired.
+	SNAPSHOT_S2RAM retains the kernel-thread freeze and restricted GFP mask.
+	Closing the device without acknowledgment restarts the system. Destroying
+	the encryption context does not retire the freshness generation. User space must
+	keep the backing filesystems quiescent and enforce freshness on cold
+	restore, consuming the generation before SNAPSHOT_ATOMIC_RESTORE.
+	A successful cold restore destroys the saved encryption context on return
+	from SNAPSHOT_CREATE_IMAGE and requires an explicit reset before reuse.
+	Its generation was consumed before restore; no extra increment is needed.
 
 The device's read() operation can be used to transfer the snapshot image from
 the kernel.  It has the following limitations:
@@ -126,12 +230,18 @@ the kernel.  It has the following limitations:
 The device's write() operation is used for uploading the system memory snapshot
 into the kernel.  It has the same limitations as the read() operation.
 
-The release() operation frees all memory allocated for the snapshot image
+Except for an unretired output that opted into the contract above, the
+release() operation frees all memory allocated for the snapshot image
 and all swap pages allocated with SNAPSHOT_ALLOC_SWAP_PAGE (if any).
 Thus it is not necessary to use either SNAPSHOT_FREE or
 SNAPSHOT_FREE_SWAP_PAGES before closing the device (in fact it will also
 unfreeze user space processes frozen by SNAPSHOT_UNFREEZE if they are
 still frozen when the device is being closed).
+
+For an encrypted restore opened for writing, closing the device restarts the
+system if encrypted input has been received and userspace is still frozen.
+If the emergency restart returns, the kernel panics. SNAPSHOT_FREE and
+SNAPSHOT_UNFREEZE remain explicit operations for cancelling the restore.
 
 Currently it is assumed that the userland utilities reading/writing the
 snapshot image from/to the kernel will use a swap partition, called the resume
