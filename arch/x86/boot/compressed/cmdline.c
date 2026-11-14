@@ -16,11 +16,15 @@ static inline char rdfs8(addr_t addr)
 #include "../cmdline.c"
 unsigned long get_cmd_line_ptr(void)
 {
+#ifdef CONFIG_CMDLINE_OVERRIDE
+	return (unsigned long)CONFIG_CMDLINE;
+#else
 	unsigned long cmd_line_ptr = boot_params_ptr->hdr.cmd_line_ptr;
 
 	cmd_line_ptr |= (u64)boot_params_ptr->ext_cmd_line_ptr << 32;
 
 	return cmd_line_ptr;
+#endif
 }
 int cmdline_find_option(const char *option, char *buffer, int bufsize)
 {

@@ -182,6 +182,7 @@ void __init clear_bss(void)
 	       (unsigned long) __brk_limit - (unsigned long) __brk_base);
 }
 
+#ifndef CONFIG_CMDLINE_OVERRIDE
 static unsigned long get_cmd_line_ptr(void)
 {
 	unsigned long cmd_line_ptr = boot_params.hdr.cmd_line_ptr;
@@ -190,11 +191,14 @@ static unsigned long get_cmd_line_ptr(void)
 
 	return cmd_line_ptr;
 }
+#endif
 
 static void __init copy_bootdata(char *real_mode_data)
 {
-	char * command_line;
+#ifndef CONFIG_CMDLINE_OVERRIDE
+	char *command_line;
 	unsigned long cmd_line_ptr;
+#endif
 
 	/*
 	 * If SME is active, this will create decrypted mappings of the
@@ -204,11 +208,15 @@ static void __init copy_bootdata(char *real_mode_data)
 
 	memcpy(&boot_params, real_mode_data, sizeof(boot_params));
 	sanitize_boot_params(&boot_params);
+#ifdef CONFIG_CMDLINE_OVERRIDE
+	strscpy(boot_command_line, CONFIG_CMDLINE, COMMAND_LINE_SIZE);
+#else
 	cmd_line_ptr = get_cmd_line_ptr();
 	if (cmd_line_ptr) {
 		command_line = __va(cmd_line_ptr);
 		memcpy(boot_command_line, command_line, COMMAND_LINE_SIZE);
 	}
+#endif
 
 	/*
 	 * The old boot data is no longer needed and won't be reserved,

@@ -10,6 +10,7 @@
 #include <linux/start_kernel.h>
 #include <linux/mm.h>
 #include <linux/memblock.h>
+#include <linux/string.h>
 
 #include <asm/desc.h>
 #include <asm/setup.h>
@@ -54,6 +55,9 @@ asmlinkage __visible void __init __noreturn i386_start_kernel(void)
 	/* Make sure IDT is set up before any exception happens */
 	idt_setup_early_handler();
 
+#ifdef CONFIG_CMDLINE_OVERRIDE
+	strscpy(boot_command_line, CONFIG_CMDLINE, COMMAND_LINE_SIZE);
+#endif
 	load_ucode_bsp();
 	zap_early_initrd_mapping();
 
