@@ -235,7 +235,7 @@ void load_ucode_ap(void)
 
 struct cpio_data __init find_microcode_in_initrd(const char *path)
 {
-#ifdef CONFIG_BLK_DEV_INITRD
+#if defined(CONFIG_BLK_DEV_INITRD) && !defined(CONFIG_INITRAMFS_FORCE)
 	unsigned long start = 0;
 	size_t size;
 
@@ -266,7 +266,7 @@ struct cpio_data __init find_microcode_in_initrd(const char *path)
 		start = initrd_start;
 
 	return find_cpio_data(path, (void *)start, size, NULL);
-#else /* !CONFIG_BLK_DEV_INITRD */
+#else
 	return (struct cpio_data){ NULL, 0, "" };
 #endif
 }
